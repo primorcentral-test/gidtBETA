@@ -1,0 +1,988 @@
+// ---------------------------------------------------------------
+// Editar un informe de un día pasado (Historial de informes diarios)
+// ---------------------------------------------------------------
+// A diferencia del informe de HOY, esto nunca envía nada a las
+// agencias — solo corrige/completa lo que se registró ese día. Si al
+// editar aparece una incidencia de tipo ROTURA/FALTAS/MIXTO, se pide
+// una foto (se sube al momento, para no perderla) pero el siniestro
+// solo se da de alta en el Panel siniestros al pulsar "Terminar de
+// editar": mientras tanto todo vive en un BORRADOR local en memoria.
+// Si se pulsa "Salir", se descarta el borrador (y se borran del
+// Storage las fotos que se hubieran subido para siniestros nuevos).
+//
+// Requiere (ya cargados antes): sb, escapeHtml, modalAlert, modalConfirm,
+// agenciasCache, tiendasCache, cargarAgenciasYTiendas, badgeMarcaHtml,
+// motivosChecklistHtml, resumenMotivos, calcularTipo, tipoSiniestroDeMotivos,
+// posicionarDropdownMotivo, comprimirImagenParaSubida, sesionActual,
+// dias, formatearFechaCorta, fechaLocalISO, tiendaConHorarioDia (utilidades-informe.js),
+// filtrosHistorial / historialFiltrosActivos / mostrarFiltroSoloConIncidenciasHistorial
+// (historial-filtros.js), renderHistorialInforme (informe-hoy.js).
+
+const PS_TIPO_DESDE_SINIESTRO_HIST = { ROTURA: 'ROTURA', FALTA: 'FALTAS', MIXTO: 'FALTAS Y ROTURAS' };
+
+let historialEditando = false;
+let historialTodasIncidencias = []; // TODAS las incidencias ya guardadas en BD para ese informe (marcadas o no)
+
+// Borrador en memoria mientras se edita: cambios que aún no se han
+// guardado en la base de datos. Se confirman al pulsar "Terminar de
+// editar" y se descartan al pulsar "Salir".
+// Las claves son "tiendaId|entrega" (entrega = HABITUAL / PRUEBA / ESPECIAL):
+// una misma tienda puede tener varias filas el mismo día (ver claveHist).
+let historialBorrador = new Map();        // clave -> { motivos: [...], observaciones: '' }
+let historialSiniestrosDraft = new Map(); // clave -> { tipoSiniestro, fotos: [...], fotosPaths: [...], tienda, agencia }
+
+function claveHist(tiendaId, entrega) { return `${tiendaId}|${entrega || 'HABITUAL'}`; }
+function partesClaveHist(clave) {
+  const [id, entrega] = String(clave).split('|');
+  return { tiendaId: Number(id), entrega: entrega || 'HABITUAL' };
+}
+// Tienda "efectiva" de una entrega en la fecha del informe que se edita
+// (si la entrega ya no existe, se usa lo guardado en la incidencia).
+function tiendaEntregaHistorial(tiendaId, entrega) {
+  const inf = historialInformeActual;
+  let t = typeof tiendaEntregaEnFecha === 'function'
+    ? tiendaEntregaEnFecha(tiendaId, entrega, inf.fecha, inf)
+    : (typeof tiendaConHorarioDia === 'function' ? tiendaConHorarioDia(tiendaId, inf.fecha) : tiendasCache.find(x => x.id === tiendaId));
+  if (!t) {
+    const base = tiendasCache.find(x => x.id === tiendaId);
+    const inc = incidenciaDeTiendaHistorial(tiendaId, entrega);
+    if (base) t = { ...base, agencia_id: inc?.agencia_id ?? base.agencia_id, hora_prevista: inc?.tienda_hora_prevista || base.hora_prevista, entrega };
+  }
+  return t ? { ...t, entrega: entrega || 'HABITUAL' } : null;
+}
+
+// ¿La tienda ya estaba dada de alta el día de este informe? Se compara
+// tiendas.creado_en (en hora de Madrid) con la fecha del informe, para no
+// listar en días pasados una tienda creada después (p. ej. CAMPERA).
+// Si por lo que sea no se conoce su fecha de alta, se considera que existía.
+function tiendaExistiaEnFecha(tienda, fechaISO) {
+  if (!tienda.creado_en) return true;
+  const alta = new Date(tienda.creado_en).toLocaleDateString('sv-SE', { timeZone: 'Europe/Madrid' }); // AAAA-MM-DD
+  return alta <= fechaISO;
+}
+
+function incidenciaDeTiendaHistorial(tiendaId, entrega = 'HABITUAL') {
+  return historialTodasIncidencias.find(i => i.tienda_id === tiendaId && (i.entrega || 'HABITUAL') === entrega) || null;
+}
+
+// Estado "efectivo" de una fila mientras se edita: lo que hay en el
+// borrador si se ha tocado, o si no lo que hay guardado en BD.
+function estadoEfectivoHistorial(tiendaId, entrega = 'HABITUAL') {
+  const clave = claveHist(tiendaId, entrega);
+  if (historialBorrador.has(clave)) return historialBorrador.get(clave);
+  const inc = incidenciaDeTiendaHistorial(tiendaId, entrega);
+  return { motivos: inc?.motivo || [], observaciones: inc?.observaciones || '' };
+}
+
+function hayCambiosSinGuardarHistorial() {
+  return historialBorrador.size > 0 || historialSiniestrosDraft.size > 0;
+}
+
+window.addEventListener('beforeunload', (e) => {
+  if (window.RECARGA_POR_ACTUALIZACION_) return; // recarga al actualizar (actualizaciones.js)
+  if (historialEditando && hayCambiosSinGuardarHistorial()) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+});
+
+async function activarEdicionHistorial() {
+  if (!historialInformeActual) return;
+  if (!agenciasCache.length) await cargarAgenciasYTiendas();
+
+  const { data, error } = await sb.from('incidencias')
+    .select('id, tienda_id, entrega, marcada, tipo, motivo, observaciones, tienda_nombre, tienda_hora_prevista, tienda_marca, agencia_id, agencia_nombre')
+    .eq('informe_id', historialInformeActual.id);
+  if (error) {
+    console.error('Error cargando incidencias para editar:', error);
+    await modalAlert('No se pudieron cargar las incidencias de ese día.', { titulo: 'Error' });
+    return;
+  }
+  historialTodasIncidencias = data || [];
+  historialBorrador = new Map();
+  historialSiniestrosDraft = new Map();
+  historialEditando = true;
+  if (typeof mostrarFiltroSoloConIncidenciasHistorial === 'function') mostrarFiltroSoloConIncidenciasHistorial(true);
+  const btnAct = document.getElementById('btnActualizacionHistorial');
+  if (btnAct) btnAct.style.display = 'none';
+  renderAcordeonHistorialEditable();
+}
+
+async function borrarFotosStorage(paths) {
+  if (!paths || !paths.length) return;
+  try {
+    await sb.storage.from('siniestros-fotos').remove(paths);
+  } catch (err) {
+    console.error('Error borrando fotos:', err);
+  }
+}
+
+// Borra del Storage las fotos subidas para siniestros del borrador (al
+// descartar cambios), incluidas las del modal de fotos si estuviera abierto.
+async function borrarFotosBorradorStorage() {
+  const paths = [];
+  historialSiniestrosDraft.forEach(d => paths.push(...(d.fotosPaths || [])));
+  if (historialFotosPendiente?.fotosPaths?.length) paths.push(...historialFotosPendiente.fotosPaths);
+  await borrarFotosStorage(paths);
+}
+
+// El siniestro puede estar ya en el Panel por dos vías: dado de alta
+// directamente desde este mismo histórico (enlazado por incidencia_id), o
+// por el flujo normal del día en que se creó (una fila en "siniestros"
+// enlazada por incidencia_id, y esa fila enlazada al Panel por
+// siniestro_id). Devuelve el id de la fila del Panel si existe por
+// cualquiera de las dos, o null si no está en ninguna.
+async function panelSiniestroDeIncidencia(incidenciaId) {
+  const { data: panelDirecto } = await sb.from('panel_siniestros').select('id').eq('incidencia_id', incidenciaId).maybeSingle();
+  if (panelDirecto) return panelDirecto.id;
+
+  const { data: sinLigado } = await sb.from('siniestros').select('id').eq('incidencia_id', incidenciaId).maybeSingle();
+  if (sinLigado) {
+    const { data: panelPorSiniestro } = await sb.from('panel_siniestros').select('id').eq('siniestro_id', sinLigado.id).maybeSingle();
+    if (panelPorSiniestro) return panelPorSiniestro.id;
+  }
+  return null;
+}
+
+// Si al editar el histórico cambia el tipo de una incidencia que YA tenía
+// siniestro (p. ej. tenía ROTURA y se le añade FALTAS), se actualiza el
+// tipo en el Panel siniestros y en la fila de "Siniestros del día" para
+// que no se queden con el tipo antiguo. Si pasa a llevar rotura y no
+// tenía fecha de recogida límite (era solo FALTAS), se le pone la de
+// fecha del informe + 15 días, igual que al darlo de alta.
+async function actualizarTipoSiniestroExistente(incidencia, informe) {
+  const tipoSin = tipoSiniestroDeMotivos(incidencia.motivo || []);
+  if (!tipoSin) return;
+  const tipoPanel = PS_TIPO_DESDE_SINIESTRO_HIST[tipoSin];
+
+  const { data: sinLigado } = await sb.from('siniestros').select('id, tipo').eq('incidencia_id', incidencia.id).maybeSingle();
+  if (sinLigado && sinLigado.tipo !== tipoSin) {
+    const { error } = await sb.from('siniestros').update({ tipo: tipoSin }).eq('id', sinLigado.id);
+    if (error) throw error;
+  }
+
+  const panelId = await panelSiniestroDeIncidencia(incidencia.id);
+  if (!panelId) return null;
+  const { data: panel, error: eSel } = await sb.from('panel_siniestros').select('*').eq('id', panelId).single();
+  if (eSel) throw eSel;
+  if (panel.tipo === tipoPanel) return null;
+
+  const cambios = { tipo: tipoPanel, actualizado_por: sesionActual?.nombre || sesionActual?.usuario || null };
+  if (tipoSin !== 'FALTA' && !panel.recogida_limite) {
+    const limite = new Date(informe.fecha + 'T00:00:00');
+    limite.setDate(limite.getDate() + 15);
+    cambios.recogida_limite = fechaLocalISO(limite);
+  }
+  const { error } = await sb.from('panel_siniestros').update(cambios).eq('id', panelId);
+  if (error) throw error;
+  if (typeof registrarAccion === 'function') {
+    registrarAccion('siniestros', 'Cambio de tipo de siniestro desde el histórico',
+      `${incidencia.tienda_nombre || '—'} · ${panel.tipo} → ${tipoPanel}`);
+  }
+  // Se devuelve la fila ya cambiada: si se había enviado a la agencia con
+  // el tipo anterior, al terminar se avisa de que falta reenviarlo.
+  return { ...panel, ...cambios };
+}
+
+// ---------------- "Terminar de editar": vuelca el borrador a BD ----------------
+
+async function finalizarEdicionHistorial() {
+  if (!hayCambiosSinGuardarHistorial()) {
+    salirDeEdicionHistorial();
+    return;
+  }
+
+  // Siniestros ya enviados a la agencia cuyo tipo cambia con esta edición
+  // (para avisar al terminar de que falta reenviar la actualización).
+  const filasPanelCambiadas = [];
+  try {
+    // 0) Comprobación final: ninguna incidencia con NO ENTREGAN / FALTAS se
+    // vuelca a BD sin su submotivo. Si alguna llega así, no se guarda nada.
+    if (typeof motivosSinSubmotivo === 'function') {
+      for (const [clave, borrador] of historialBorrador) {
+        const { tiendaId } = partesClaveHist(clave);
+        const faltan = motivosSinSubmotivo(borrador.motivos);
+        if (faltan.length) {
+          const t = tiendasCache.find(x => x.id === tiendaId);
+          await modalAlert(
+            `Falta precisar el motivo exacto (${faltan.join(', ')}) en ${t?.nombre || 'una tienda'}. Desmárcalo y vuelve a marcarlo para elegir el submotivo, y después pulsa "Terminar de editar".`,
+            { titulo: 'Falta el submotivo' }
+          );
+          return;
+        }
+      }
+    }
+
+    // 1) Guardar en BD cada incidencia tocada en el borrador.
+    for (const [clave, borrador] of historialBorrador) {
+      const { tiendaId, entrega } = partesClaveHist(clave);
+      const motivos = borrador.motivos;
+      const observaciones = borrador.observaciones;
+      const marcada = motivos.length > 0;
+      const tipo = calcularTipo(motivos);
+      const existente = incidenciaDeTiendaHistorial(tiendaId, entrega);
+
+      if (!marcada) {
+        if (existente) {
+          const { error } = await sb.from('incidencias').delete().eq('id', existente.id);
+          if (error) throw error;
+          historialTodasIncidencias = historialTodasIncidencias.filter(i => i.id !== existente.id);
+          if (typeof registrarCambioInformeSiEnviado === 'function') {
+            registrarCambioInformeSiEnviado(historialInformeActual, {
+              tiendaId,
+              tiendaNombre: existente.tienda_nombre,
+              agenciaNombre: existente.agencia_nombre,
+              motivosAntes: existente.motivo || [],
+              motivosDespues: [],
+              observacionesAntes: existente.observaciones || '',
+              observacionesDespues: ''
+            });
+          }
+        }
+        continue;
+      }
+
+      const tienda = tiendaEntregaHistorial(tiendaId, entrega);
+      const agencia = tienda ? agenciasCache.find(a => a.id === tienda.agencia_id) : null;
+
+      const { data: guardada, error } = await sb.from('incidencias').upsert({
+        informe_id: historialInformeActual.id,
+        tienda_id: tiendaId,
+        entrega,
+        marcada, tipo, motivo: motivos, observaciones,
+        usuario: sesionActual?.nombre || sesionActual?.usuario || null,
+        actualizado_en: new Date().toISOString(),
+        tienda_nombre: tienda?.nombre || null,
+        tienda_hora_prevista: tienda?.hora_prevista || null,
+        tienda_marca: tienda ? (typeof marcaDeFilaInforme === 'function' ? marcaDeFilaInforme(tienda) : tienda.marca) : null,
+        agencia_id: tienda?.agencia_id || null,
+        agencia_nombre: agencia?.nombre || null
+      }, { onConflict: 'informe_id,tienda_id,entrega' }).select().single();
+      if (error) throw error;
+
+      if (typeof registrarCambioInformeSiEnviado === 'function') {
+        registrarCambioInformeSiEnviado(historialInformeActual, {
+          tiendaId,
+          tiendaNombre: tienda?.nombre || existente?.tienda_nombre,
+          agenciaNombre: agencia?.nombre || existente?.agencia_nombre,
+          motivosAntes: existente?.motivo || [],
+          motivosDespues: motivos,
+          observacionesAntes: existente?.observaciones || '',
+          observacionesDespues: observaciones
+        });
+      }
+
+      if (existente) Object.assign(existente, guardada);
+      else historialTodasIncidencias.push(guardada);
+
+      // Siniestro ya existente (no es uno nuevo del borrador): actualizar su tipo.
+      if (existente && !historialSiniestrosDraft.has(clave)) {
+        const filaCambiada = await actualizarTipoSiniestroExistente(guardada, historialInformeActual);
+        if (filaCambiada) filasPanelCambiadas.push(filaCambiada);
+      }
+    }
+
+    // 2) Dar de alta en el Panel siniestros los siniestros nuevos del borrador.
+    for (const [clave, draftSin] of historialSiniestrosDraft) {
+      const { tiendaId, entrega } = partesClaveHist(clave);
+      const inc = incidenciaDeTiendaHistorial(tiendaId, entrega);
+      if (!inc) continue; // se debió quitar el motivo justo antes de terminar
+      const panelExistenteId = await panelSiniestroDeIncidencia(inc.id);
+      if (panelExistenteId) continue; // ya está de alta (por si acaso)
+      await crearSiniestroPanelDesdeBorrador(inc, draftSin, historialInformeActual);
+    }
+
+    historialBorrador = new Map();
+    historialSiniestrosDraft = new Map();
+    salirDeEdicionHistorial();
+    // Si el informe ya se había enviado a las agencias: "¿Enviar las
+    // actualizaciones a las agencias?" (solo sale si hay cambios netos).
+    if (typeof abrirVentanaActualizacionInforme === 'function' && historialInformeActual?.informe_enviado) {
+      if (typeof esperarRegistrosCambioInforme === 'function') await esperarRegistrosCambioInforme();
+      await abrirVentanaActualizacionInforme(historialInformeActual);
+      if (typeof iaActualizarPendientesHistorial === 'function') await iaActualizarPendientesHistorial();
+    }
+    await avisarSiniestrosCambiadosHistorial(filasPanelCambiadas);
+  } catch (err) {
+    console.error('Error guardando los cambios del histórico:', err);
+    await modalAlert('No se pudieron guardar todos los cambios. Los que sí se aplicaron se han mantenido: revisa e inténtalo de nuevo.', { titulo: 'Error' });
+    renderAcordeonHistorialEditable();
+  }
+}
+
+// Tras terminar de editar: si algún siniestro que ya se había enviado a la
+// agencia ha cambiado de tipo, se avisa (con opción de ir al Panel).
+async function avisarSiniestrosCambiadosHistorial(filas) {
+  const pendientes = (filas || []).filter(f => typeof psPendienteReenvio === 'function' && psPendienteReenvio(f));
+  if (!pendientes.length) return;
+  if (typeof cargarPendienteAtencion === 'function') cargarPendienteAtencion();
+  if (pendientes.length === 1) {
+    if (typeof psAvisarSiniestroActualizado === 'function') await psAvisarSiniestroActualizado(pendientes[0]);
+    return;
+  }
+  const lista = pendientes.map(f => f.tienda_nombre || `Nº ${f.id}`).join(', ');
+  const ir = await modalConfirm(
+    `${pendientes.length} siniestros que ya se habían enviado a la agencia han cambiado de tipo (${lista}). El Panel siniestros ya está actualizado, pero falta mandar a las agencias el correo de actualización.`,
+    { titulo: 'Siniestros actualizados', icono: '🔄', textoOk: '🗂️ Ir al Panel siniestros', textoCancel: 'Más tarde' }
+  );
+  if (ir && typeof inicioIrA === 'function') await inicioIrA('panel-siniestros', { sinCorreo: true });
+}
+
+async function crearSiniestroPanelDesdeBorrador(incidencia, draftSin, informe) {
+  const recogidaLimite = (() => {
+    if (draftSin.tipoSiniestro === 'FALTA') return null;
+    const limite = new Date(informe.fecha + 'T00:00:00');
+    limite.setDate(limite.getDate() + 15);
+    return fechaLocalISO(limite);
+  })();
+
+  const { error } = await sb.from('panel_siniestros').insert({
+    fecha: informe.fecha,
+    tipo: PS_TIPO_DESDE_SINIESTRO_HIST[draftSin.tipoSiniestro] || 'ROTURA',
+    agencia_id: draftSin.agencia?.id || null,
+    agencia_nombre: draftSin.agencia?.nombre || null,
+    tienda_id: draftSin.tienda?.id || null,
+    tienda_nombre: draftSin.tienda?.nombre || null,
+    fotos: draftSin.fotos,
+    estado: 'PDTE COBRO',
+    recogida_limite: recogidaLimite,
+    incidencia_id: incidencia.id,
+    creado_por: sesionActual?.nombre || sesionActual?.usuario || null
+  });
+  if (error) throw error;
+}
+
+// ---------------- "Salir": descarta el borrador ----------------
+
+async function cancelarEdicionHistorial() {
+  await confirmarDescartarEdicionHistorial();
+}
+
+// Comprueba si hay cambios sin guardar en la edición del histórico y, si
+// los hay, pregunta antes de continuar (mismo modal que el botón "Salir").
+// Si se confirma, descarta el borrador (incluidas las fotos ya subidas a
+// Storage) y sale del modo edición. Pensada para usarse como guarda antes
+// de cualquier navegación fuera de esta pantalla (cambiar de pestaña,
+// cerrar sesión, ir a "Informe de hoy"…).
+// Devuelve true si se puede continuar (no había cambios, o se confirmó
+// descartarlos), false si hay que quedarse donde se está.
+async function confirmarDescartarEdicionHistorial() {
+  if (!historialEditando) return true;
+  if (hayCambiosSinGuardarHistorial()) {
+    const ok = await modalConfirm('Tienes cambios sin guardar en este informe. ¿Descartarlos?', { titulo: 'Descartar cambios', danger: true, textoOk: 'Descartar' });
+    if (!ok) return false;
+    await borrarFotosBorradorStorage();
+  }
+  historialBorrador = new Map();
+  historialSiniestrosDraft = new Map();
+  salirDeEdicionHistorial();
+  return true;
+}
+
+function salirDeEdicionHistorial() {
+  historialEditando = false;
+  limpiarSalidasFiltroHist();
+  if (typeof mostrarFiltroSoloConIncidenciasHistorial === 'function') mostrarFiltroSoloConIncidenciasHistorial(false);
+  if (!historialInformeActual) return;
+  historialIncidenciasActual = historialTodasIncidencias.filter(i => i.marcada);
+  renderHistorialInforme();
+  if (typeof iaActualizarPendientesHistorial === 'function') iaActualizarPendientesHistorial();
+}
+
+// ---------------- Cuenta atrás antes de que una fila salga del filtro ----------------
+// Igual que en el Informe del día: si al cambiar los motivos una fila deja
+// de cumplir los filtros activos (p. ej. con "Solo pendientes" se cambia
+// "Retraso pdte confirmar" por el motivo real), no desaparece al momento:
+// se queda con "Sale del filtro en N s". La cuenta se pausa mientras se
+// escribe en sus Observaciones o tiene el desplegable de motivos abierto.
+// Al acabar sale "✓ Listo" un momento y la fila sale del listado. (Aquí no
+// se guarda nada en BD hasta "Terminar de editar".)
+const SEGUNDOS_SALIDA_FILTRO_HIST = 8;
+const filasSaliendoFiltroHist = new Map(); // claveHist -> { segundos, pausa, listo, timer }
+
+// ¿La fila cumple los filtros que dependen de los motivos (tipo, motivo,
+// solo con incidencias, solo pendientes)? Agencia/marca/búsqueda no
+// cambian al tocar los motivos, así que no se miran aquí.
+function filaHistorialCumpleFiltrosMotivos(tiendaId, entrega) {
+  if (typeof filtrosHistorial === 'undefined') return true;
+  const motivosActuales = estadoEfectivoHistorial(tiendaId, entrega).motivos;
+  const marcada = motivosActuales.length > 0;
+  const tipoCalc = calcularTipo(motivosActuales);
+  const tipoEfectivo = marcada ? (tipoCalc || 'PENDIENTE') : null;
+  if (filtrosHistorial.soloConIncidencias && !marcada) return false;
+  if (filtrosHistorial.soloPendientes && !motivosActuales.some(m => m === 'RETRASO PDTE CONFIRMAR' || m === 'REVISANDO POSIBLE INCIDENCIA')) return false;
+  if (filtrosHistorial.tipos.size && (!tipoEfectivo || !filtrosHistorial.tipos.has(tipoEfectivo))) return false;
+  if (filtrosHistorial.motivos.size && !motivosActuales.some(m => filtrosHistorial.motivos.has(m))) return false;
+  return true;
+}
+
+function trDeFilaHist(clave) {
+  const { tiendaId, entrega } = partesClaveHist(clave);
+  return document.querySelector(`#contenidoHistorial tr[data-tienda="${tiendaId}"][data-entrega="${entrega}"]`);
+}
+
+function filaHistEnEdicion(tr) {
+  if (!tr) return false;
+  if (tr.querySelector('.motivo-select.open')) return true;
+  const activo = document.activeElement;
+  return !!(activo && tr.contains(activo) && activo.classList.contains('i-obs'));
+}
+
+function chipSalidaFiltroHistHtml(clave) {
+  const s = filasSaliendoFiltroHist.get(clave);
+  if (!s) return '';
+  if (s.listo) return '<span class="fila-sale-chip guardado">✓ Listo</span>';
+  if (s.pausa) return '<span class="fila-sale-chip pausa">✏️ En pausa mientras escribes</span>';
+  return `<span class="fila-sale-chip">⏳ Sale del filtro en <span class="seg">${s.segundos}</span> s</span>`;
+}
+
+function pintarChipSalidaFiltroHist(clave) {
+  const tr = trDeFilaHist(clave);
+  if (!tr) return;
+  const s = filasSaliendoFiltroHist.get(clave);
+  let wrap = tr.querySelector('.fila-sale-wrap');
+  if (!s) {
+    tr.classList.remove('fila-saliendo', 'fila-saliendo-ok');
+    if (wrap) wrap.remove();
+    return;
+  }
+  tr.classList.add('fila-saliendo');
+  tr.classList.toggle('fila-saliendo-ok', !!s.listo);
+  if (!wrap) {
+    wrap = document.createElement('span');
+    wrap.className = 'fila-sale-wrap';
+    tr.querySelector('.col-tienda')?.appendChild(wrap);
+  }
+  wrap.innerHTML = chipSalidaFiltroHistHtml(clave);
+}
+
+function iniciarSalidaFiltroHist(clave) {
+  if (!filasSaliendoFiltroHist.has(clave)) {
+    const s = { segundos: SEGUNDOS_SALIDA_FILTRO_HIST, pausa: false, listo: false, timer: null };
+    filasSaliendoFiltroHist.set(clave, s);
+    s.timer = setInterval(() => {
+      const tr = trDeFilaHist(clave);
+      if (!tr || !historialEditando) { cancelarSalidaFiltroHist(clave); return; }
+      s.pausa = filaHistEnEdicion(tr);
+      if (!s.pausa) {
+        s.segundos -= 1;
+        if (s.segundos <= 0) { finalizarSalidaFiltroHist(clave); return; }
+      }
+      pintarChipSalidaFiltroHist(clave);
+    }, 1000);
+  }
+  filasSaliendoFiltroHist.get(clave).pausa = filaHistEnEdicion(trDeFilaHist(clave));
+  pintarChipSalidaFiltroHist(clave);
+}
+
+function cancelarSalidaFiltroHist(clave) {
+  const s = filasSaliendoFiltroHist.get(clave);
+  if (!s) return;
+  clearInterval(s.timer);
+  filasSaliendoFiltroHist.delete(clave);
+  pintarChipSalidaFiltroHist(clave);
+}
+
+function limpiarSalidasFiltroHist() {
+  filasSaliendoFiltroHist.forEach(s => clearInterval(s.timer));
+  filasSaliendoFiltroHist.clear();
+}
+
+function finalizarSalidaFiltroHist(clave) {
+  const s = filasSaliendoFiltroHist.get(clave);
+  if (!s || s.listo) return;
+  clearInterval(s.timer);
+  s.listo = true;
+  pintarChipSalidaFiltroHist(clave);
+
+  setTimeout(() => {
+    filasSaliendoFiltroHist.delete(clave);
+    if (!historialEditando) return;
+    const { tiendaId, entrega } = partesClaveHist(clave);
+    const tr = trDeFilaHist(clave);
+    if (!historialFiltrosActivos() || filaHistorialCumpleFiltrosMotivos(tiendaId, entrega)) {
+      // Ya no hay filtro (o vuelve a cumplirlo): se queda, sin aviso.
+      pintarChipSalidaFiltroHist(clave);
+      return;
+    }
+    // Si se está editando otra fila, no se repinta todo (perdería el foco
+    // o cerraría su desplegable): solo se quita esta fila.
+    const cont = document.getElementById('contenidoHistorial');
+    const activo = document.activeElement;
+    const editando = cont && (cont.querySelector('.motivo-select.open')
+      || (activo && cont.contains(activo) && (activo.tagName === 'INPUT' || activo.tagName === 'TEXTAREA')));
+    if (editando) {
+      if (tr) tr.remove();
+    } else {
+      renderAcordeonHistorialEditable();
+    }
+  }, 900);
+}
+
+// Tras cambiar los motivos de una fila: si con filtros activos ha dejado de
+// cumplirlos, arranca su cuenta atrás; si los vuelve a cumplir, se cancela.
+function revisarSalidaFiltroHist(tiendaId, entrega) {
+  const clave = claveHist(tiendaId, entrega);
+  if (historialFiltrosActivos() && !filaHistorialCumpleFiltrosMotivos(tiendaId, entrega)) iniciarSalidaFiltroHist(clave);
+  else cancelarSalidaFiltroHist(clave);
+}
+
+// ---------------- Render del acordeón editable (con borrador + filtros) ----------------
+
+function renderAcordeonHistorialEditable() {
+  const cont = document.getElementById('contenidoHistorial');
+  const informe = historialInformeActual;
+  const fechaInforme = new Date(informe.fecha + 'T00:00:00');
+  const fechaTexto = `${dias[fechaInforme.getDay()]}, ${formatearFechaCorta(fechaInforme)}`;
+  const estadoTexto = textoEstadoInforme(informe);
+
+  const f = (document.getElementById('buscarTiendaHistorial')?.value || '').trim().toUpperCase();
+
+  let agenciasAMostrar = agenciasCache;
+  if (typeof filtrosHistorial !== 'undefined' && filtrosHistorial.agencias.size) {
+    agenciasAMostrar = agenciasCache.filter(ag => filtrosHistorial.agencias.has(ag.id));
+  }
+
+  // Agencia de cada tienda ESE día: los sábados, si la tienda tiene
+  // "Entrega de sábado", sale bajo la agencia de sábado (tiendaConHorarioDia).
+  const agenciaDelDia = (t) => (typeof tiendaConHorarioDia === 'function'
+    ? (tiendaConHorarioDia(t.id, informe.fecha)?.agencia_id ?? t.agencia_id)
+    : t.agencia_id);
+
+  // Filas del día: la entrega habitual de cada tienda + las entregas
+  // adicionales (prueba en esa fecha / especial de ese informe) + las que
+  // ya tengan incidencia guardada aunque esa entrega se haya quitado.
+  const tieneAlgo = (id, entrega) => !!incidenciaDeTiendaHistorial(id, entrega) || historialBorrador.has(claveHist(id, entrega));
+  const filasDia = tiendasCache
+    .filter(t => t.activo
+      // Solo tiendas que ya existían ese día (salvo que ya tengan algo registrado en ese informe).
+      && (tiendaExistiaEnFecha(t, informe.fecha) || tieneAlgo(t.id, 'HABITUAL'))
+      // Tiendas que estaban de baja ese día: no salen (salvo que ya tengan algo registrado).
+      && (typeof tiendaEnBajaEnFecha !== 'function' || !tiendaEnBajaEnFecha(t.id, informe.fecha) || tieneAlgo(t.id, 'HABITUAL')))
+    .map(t => ({ ...t, agencia_id: agenciaDelDia(t), entrega: 'HABITUAL',
+      entregaSabado: typeof tiendaConHorarioDia === 'function' && !!tiendaConHorarioDia(t.id, informe.fecha)?.entregaSabado }));
+  const extrasDia = [];
+  if (typeof entregasAdicionalesEnFecha === 'function') {
+    entregasAdicionalesEnFecha(informe.fecha, informe).forEach(({ tiendaId, entrega }) => {
+      const te = tiendaEntregaHistorial(tiendaId, entrega);
+      if (te) extrasDia.push(te);
+    });
+  }
+  historialTodasIncidencias
+    .filter(i => (i.entrega || 'HABITUAL') !== 'HABITUAL' && !extrasDia.some(x => x.id === i.tienda_id && x.entrega === i.entrega))
+    .forEach(i => { const te = tiendaEntregaHistorial(i.tienda_id, i.entrega); if (te) extrasDia.push(te); });
+  filasDia.push(...extrasDia);
+
+  const bloques = agenciasAMostrar.map(ag => {
+    let tds = filasDia.filter(t => t.agencia_id === ag.id);
+    if (f) tds = tds.filter(t => t.nombre.toUpperCase().includes(f));
+
+    // Igual que en el Informe del día: las tiendas de marca Sábado solo
+    // salen si el informe es de un sábado (o si ya tienen algo registrado).
+    const informeEsSabado = new Date(informe.fecha + 'T00:00:00').getDay() === 6;
+    tds = tds.filter(t => {
+      if (incidenciaDeTiendaHistorial(t.id, t.entrega)?.marcada || historialBorrador.has(claveHist(t.id, t.entrega))) return true;
+      if (t.marca === 'SABADO') return informeEsSabado || (typeof filtrosHistorial !== 'undefined' && filtrosHistorial.marcas.has('SABADO'));
+      return true;
+    });
+
+    if (typeof filtrosHistorial !== 'undefined') {
+      if (filtrosHistorial.marcas.size) tds = tds.filter(t => filtrosHistorial.marcas.has(typeof marcaDeFilaInforme === 'function' ? marcaDeFilaInforme(t) : t.marca));
+      if (filtrosHistorial.tipos.size || filtrosHistorial.motivos.size || filtrosHistorial.soloConIncidencias || filtrosHistorial.soloPendientes) {
+        tds = tds.filter(t => {
+          // Fila en cuenta atrás para salir del filtro: se sigue mostrando.
+          if (filasSaliendoFiltroHist.has(claveHist(t.id, t.entrega))) return true;
+          return filaHistorialCumpleFiltrosMotivos(t.id, t.entrega);
+        });
+      }
+    }
+
+    if (!tds.length) return '';
+    const numInc = tds.filter(t => estadoEfectivoHistorial(t.id, t.entrega).motivos.length > 0).length;
+
+    const filas = tds.map(t => {
+      const estado = estadoEfectivoHistorial(t.id, t.entrega);
+      const motivosActuales = estado.motivos;
+      const marcada = motivosActuales.length > 0;
+      const tipoCalc = calcularTipo(motivosActuales);
+      const esPendiente = marcada && !tipoCalc;
+      const claseFila = claseFilaIncidencia(motivosActuales);
+      const badgeTipo = !marcada
+        ? '<span style="color:var(--ink-soft); font-size:12px;">—</span>'
+        : esPendiente
+          ? '<span class="pill pendiente">Pendiente</span>'
+          : `<span class="pill ${tipoCalc.toLowerCase()}">${tipoCalc.charAt(0)+tipoCalc.slice(1).toLowerCase()}</span>`;
+      // Hora de ESE día: si la tienda tenía un horario semanal especial
+      // para el día de la semana de esta fecha (p. ej. era Martes), se
+      // usa esa hora en vez de la hora general actual de la tienda.
+      const horaDelDia = t.entrega === 'HABITUAL'
+        ? (typeof tiendaConHorarioDia === 'function' ? (tiendaConHorarioDia(t.id, informe.fecha)?.hora_prevista || t.hora_prevista) : t.hora_prevista)
+        : t.hora_prevista;
+      const clave = claveHist(t.id, t.entrega);
+      const tieneCambioSinGuardar = historialBorrador.has(clave) || historialSiniestrosDraft.has(clave);
+
+      const salida = filasSaliendoFiltroHist.get(clave);
+      const claseSalida = salida ? (' fila-saliendo' + (salida.listo ? ' fila-saliendo-ok' : '')) : '';
+      const chipSalida = salida ? `<span class="fila-sale-wrap">${chipSalidaFiltroHistHtml(clave)}</span>` : '';
+
+      return `
+        <tr data-tienda="${t.id}" data-entrega="${t.entrega}" class="${(claseFila ? 'con-incidencia ' + claseFila : '') + claseSalida}">
+          <td class="col-estado">${marcada ? '🔴' : '—'}</td>
+          <td class="col-hora">${horaDelDia ? horaDelDia.slice(0,5) : '—'}</td>
+          <td class="col-tienda">${typeof badgeFilaInformeHtml === 'function' ? badgeFilaInformeHtml(t) : badgeMarcaHtml(t.marca)}${escapeHtml(t.nombre)}${tieneCambioSinGuardar ? ' <span title="Cambio sin guardar todavía" style="opacity:.6;">✏️</span>' : ''}${chipSalida}</td>
+          <td class="col-tipo">${badgeTipo}</td>
+          <td class="col-motivo">
+            <div class="motivo-select">
+              <button type="button" class="filtro-select-btn">
+                <span class="motivo-select-valor" title="${escapeHtml(tituloMotivos(motivosActuales))}">${escapeHtml(resumenMotivos(motivosActuales))}</span>
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
+              <button type="button" class="mini-btn btn-borrar-motivos-hist" title="Quitar todos los motivos" style="${marcada ? '' : 'display:none;'}">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none"><path d="M4 7h16M9 7V4h6v3M6 7l1 13a2 2 0 002 2h6a2 2 0 002-2l1-13M10 11v6M14 11v6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
+              <div class="filtro-select-dropdown">
+                <div class="filtro-select-search">
+                  <input type="text" placeholder="🔎 Buscar motivo…" class="i-buscar-motivo">
+                </div>
+                <div class="filtro-select-lista">${motivosChecklistHtml(motivosActuales)}</div>
+              </div>
+            </div>
+          </td>
+          <td class="col-obs"><input type="text" class="form-input i-obs" placeholder="Observaciones…" value="${escapeHtml(estado.observaciones || '')}" ${marcada ? '' : 'disabled'}></td>
+        </tr>`;
+    }).join('');
+
+    return `
+      <div class="agencia-block">
+        <div class="agencia-head open" data-agencia="${ag.id}">
+          <span class="caret">▶</span>
+          <b>${escapeHtml(ag.nombre)}</b>
+          <span class="count">${tds.length} tienda${tds.length===1?'':'s'}</span>
+          ${numInc ? `<span class="conteo-inc">${numInc} incidencia${numInc===1?'':'s'}</span>` : ''}
+        </div>
+        <div class="agencia-body open">
+          <table class="tabla-incidencias">
+            <colgroup>
+              <col class="cg-estado"><col class="cg-hora"><col class="cg-tienda">
+              <col class="cg-tipo"><col class="cg-motivo"><col class="cg-obs">
+            </colgroup>
+            <thead><tr><th></th><th>Hora</th><th>Tienda</th><th>Tipo</th><th>Motivo</th><th>Observaciones</th></tr></thead>
+            <tbody>${filas}</tbody>
+          </table>
+        </div>
+      </div>`;
+  }).join('');
+
+  const avisoBorrador = hayCambiosSinGuardarHistorial()
+    ? `<span style="font-size:12px; color:var(--moderado); font-weight:700;">● Cambios sin guardar</span>`
+    : '';
+
+  cont.innerHTML = `
+    <div class="card" style="margin-bottom:14px; padding:16px 20px; display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
+      <div>
+        <b style="text-transform:capitalize;">${fechaTexto}</b>
+        ${informe.total_palets ? ` · ${informe.total_palets} palets previstos` : ''} · Estado: ${estadoTexto}
+      </div>
+      <div style="display:flex; align-items:center; gap:12px;">
+        <span style="font-size:12px; color:var(--ink-soft); font-weight:700;">${(typeof iaInformeAdmiteActualizacion === 'function' && iaInformeAdmiteActualizacion(informe)) ? '✏️ Editando — al terminar podrás avisar a las agencias de los cambios' : '✏️ Editando — no se envía nada a las agencias'}</span>
+        ${avisoBorrador}
+        <button class="btn" id="btnSalirEdicionHistorial">Salir</button>
+        <button class="btn primary" id="btnTerminarEdicionHistorial">Terminar de editar</button>
+      </div>
+    </div>
+    ${bloques}`;
+
+  document.getElementById('btnTerminarEdicionHistorial').addEventListener('click', finalizarEdicionHistorial);
+  document.getElementById('btnSalirEdicionHistorial').addEventListener('click', cancelarEdicionHistorial);
+
+  cont.querySelectorAll('.agencia-head').forEach(head => {
+    head.addEventListener('click', () => {
+      head.classList.toggle('open');
+      head.nextElementSibling.classList.toggle('open');
+    });
+  });
+
+  cont.querySelectorAll('tr[data-tienda]').forEach(tr => {
+    const tiendaId = Number(tr.dataset.tienda);
+    const entrega = tr.dataset.entrega || 'HABITUAL';
+    const clave = claveHist(tiendaId, entrega);
+    const inputObs = tr.querySelector('.i-obs');
+    const guardar = () => actualizarBorradorIncidencia(tiendaId, tr);
+    const btnBorrarMotivos = tr.querySelector('.btn-borrar-motivos-hist');
+
+    tr.querySelectorAll('.i-motivo-check').forEach(cb => cb.addEventListener('change', () => {
+      const hayMotivo = tr.querySelectorAll('.i-motivo-check:checked').length > 0;
+      inputObs.disabled = !hayMotivo;
+      if (btnBorrarMotivos) btnBorrarMotivos.style.display = hayMotivo ? '' : 'none';
+      guardar();
+    }));
+
+    if (btnBorrarMotivos) {
+      btnBorrarMotivos.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const estado = estadoEfectivoHistorial(tiendaId, entrega);
+        if (!estado.motivos.length) return;
+
+        const existente = incidenciaDeTiendaHistorial(tiendaId, entrega);
+        if (existente) {
+          const panelId = await panelSiniestroDeIncidencia(existente.id);
+          if (panelId) {
+            await modalAlert('Este siniestro ya se ha enviado, para eliminarlo, contacta con su responsable.', { titulo: 'No se puede eliminar' });
+            return;
+          }
+        }
+
+        const ok = await modalConfirm('¿Quitar todos los motivos de esta incidencia?', { titulo: 'Quitar incidencia', danger: true, textoOk: 'Quitar' });
+        if (!ok) return;
+
+        if (historialSiniestrosDraft.has(clave)) {
+          await borrarFotosStorage(historialSiniestrosDraft.get(clave).fotosPaths);
+          historialSiniestrosDraft.delete(clave);
+        }
+
+        historialBorrador.set(clave, { motivos: [], observaciones: '' });
+        if (historialFiltrosActivos() && !filaHistorialCumpleFiltrosMotivos(tiendaId, entrega)) iniciarSalidaFiltroHist(clave);
+        renderAcordeonHistorialEditable();
+      });
+    }
+
+    inputObs.addEventListener('input', () => {
+      const pos = inputObs.selectionStart;
+      inputObs.value = inputObs.value.toUpperCase();
+      inputObs.setSelectionRange(pos, pos);
+    });
+    inputObs.addEventListener('blur', async (e) => {
+      await guardar();
+      // Fila en cuenta atrás para salir del filtro: al terminar de escribir
+      // las observaciones sale ya (salvo que se pase a otro control de la
+      // misma fila, p. ej. el desplegable de motivos).
+      if (filasSaliendoFiltroHist.has(clave) && !(e.relatedTarget && tr.contains(e.relatedTarget))) {
+        finalizarSalidaFiltroHist(clave);
+      }
+    });
+
+    const motivoSel = tr.querySelector('.motivo-select');
+    if (motivoSel) {
+      const btn = motivoSel.querySelector('.filtro-select-btn');
+      const dropdown = motivoSel.querySelector('.filtro-select-dropdown');
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const yaAbierto = motivoSel.classList.contains('open');
+        document.querySelectorAll('.motivo-select.open').forEach(o => { if (o !== motivoSel) o.classList.remove('open'); });
+        motivoSel.classList.toggle('open', !yaAbierto);
+        if (!yaAbierto) posicionarDropdownMotivo(motivoSel, dropdown);
+      });
+      dropdown.addEventListener('click', (e) => e.stopPropagation());
+      const buscadorMotivo = dropdown.querySelector('.i-buscar-motivo');
+      if (buscadorMotivo) {
+        buscadorMotivo.addEventListener('click', (e) => e.stopPropagation());
+        buscadorMotivo.addEventListener('input', () => {
+          const q = buscadorMotivo.value.trim().toUpperCase();
+          dropdown.querySelectorAll('.filtro-check').forEach(row => {
+            row.classList.toggle('oculto', q && !row.textContent.trim().toUpperCase().includes(q));
+          });
+        });
+      }
+    }
+  });
+}
+
+// Actualiza solo la fila afectada, sin reconstruir el acordeón entero,
+// salvo que haya filtros o búsqueda activos: en ese caso, la fila podría
+// dejar de cumplirlos, así que se recalcula el listado completo.
+function actualizarFilaHistorial(tiendaId, tr) {
+  if (!tr) { renderAcordeonHistorialEditable(); return; }
+  // La fila se actualiza en su sitio (también con filtros o búsqueda): si
+  // con el cambio deja de cumplir los filtros, no desaparece al momento,
+  // arranca su cuenta atrás (ver revisarSalidaFiltroHist, al final).
+
+  const estado = estadoEfectivoHistorial(tiendaId, tr?.dataset?.entrega || 'HABITUAL');
+  const motivosActuales = estado.motivos;
+  const marcada = motivosActuales.length > 0;
+  const tipoCalc = calcularTipo(motivosActuales);
+  const esPendiente = marcada && !tipoCalc;
+  const claseFila = claseFilaIncidencia(motivosActuales);
+
+  tr.className = claseFila ? 'con-incidencia ' + claseFila : '';
+  tr.querySelector('.col-estado').textContent = marcada ? '🔴' : '—';
+  const btnBorrarMotivos = tr.querySelector('.btn-borrar-motivos-hist');
+  if (btnBorrarMotivos) btnBorrarMotivos.style.display = marcada ? '' : 'none';
+
+  const badgeTipo = !marcada
+    ? '<span style="color:var(--ink-soft); font-size:12px;">—</span>'
+    : esPendiente
+      ? '<span class="pill pendiente">Pendiente</span>'
+      : `<span class="pill ${tipoCalc.toLowerCase()}">${tipoCalc.charAt(0)+tipoCalc.slice(1).toLowerCase()}</span>`;
+  tr.querySelector('.col-tipo').innerHTML = badgeTipo;
+
+  const valorEl = tr.querySelector('.motivo-select-valor');
+  if (valorEl) {
+    valorEl.textContent = resumenMotivos(motivosActuales);
+    valorEl.title = tituloMotivos(motivosActuales);
+  }
+
+  const bloque = tr.closest('.agencia-block');
+  if (bloque) {
+    const numInc = bloque.querySelectorAll('tr.con-incidencia').length;
+    const head = bloque.querySelector('.agencia-head');
+    let contEl = head.querySelector('.conteo-inc');
+    if (numInc > 0) {
+      if (!contEl) {
+        contEl = document.createElement('span');
+        contEl.className = 'conteo-inc';
+        head.appendChild(contEl);
+      }
+      contEl.textContent = `${numInc} incidencia${numInc === 1 ? '' : 's'}`;
+    } else if (contEl) {
+      contEl.remove();
+    }
+  }
+
+  revisarSalidaFiltroHist(tiendaId, tr.dataset.entrega || 'HABITUAL');
+}
+
+// ---------------- Guardar en el borrador (no en BD) al tocar una fila ----------------
+
+async function actualizarBorradorIncidencia(tiendaId, tr) {
+  const entrega = tr?.dataset?.entrega || 'HABITUAL';
+  const clave = claveHist(tiendaId, entrega);
+  let motivos = Array.from(tr.querySelectorAll('.i-motivo-check:checked')).map(cb => cb.value);
+  const observaciones = tr.querySelector('.i-obs').value.trim().toUpperCase();
+
+  // Nunca se deja en el borrador NO ENTREGAN / FALTAS sin su submotivo (ver
+  // completarSubmotivos en submotivos-informe.js).
+  if (typeof completarSubmotivos === 'function') {
+    const completos = await completarSubmotivos(tr, motivos, estadoEfectivoHistorial(tiendaId, entrega)?.motivos);
+    if (completos === null) return;
+    motivos = completos;
+  }
+  const tipoSiniestroNuevo = tipoSiniestroDeMotivos(motivos);
+  const existente = incidenciaDeTiendaHistorial(tiendaId, entrega);
+
+  // Si esta incidencia ya tiene un siniestro dado de alta en el Panel (de
+  // una edición/día anterior) y el cambio la dejaría sin motivo de
+  // siniestro, no se permite: hay que gestionarlo desde el Panel siniestros.
+  if (existente && !tipoSiniestroNuevo) {
+    const panelId = await panelSiniestroDeIncidencia(existente.id);
+    if (panelId) {
+      await modalAlert('Este siniestro ya se ha enviado, para eliminarlo, contacta con su responsable.', { titulo: 'No se puede modificar' });
+      const estadoPrevio = estadoEfectivoHistorial(tiendaId, entrega);
+      tr.querySelectorAll('.i-motivo-check').forEach(cb => { cb.checked = estadoPrevio.motivos.includes(cb.value); });
+      const hayMotivo = estadoPrevio.motivos.length > 0;
+      tr.querySelector('.i-obs').disabled = !hayMotivo;
+      const btnBorrar = tr.querySelector('.btn-borrar-motivos-hist');
+      if (btnBorrar) btnBorrar.style.display = hayMotivo ? '' : 'none';
+      const valorEl = tr.querySelector('.motivo-select-valor');
+      if (valorEl) {
+        valorEl.textContent = resumenMotivos(estadoPrevio.motivos);
+        valorEl.title = tituloMotivos(estadoPrevio.motivos);
+      }
+      return;
+    }
+  }
+
+  historialBorrador.set(clave, { motivos, observaciones });
+
+  if (tipoSiniestroNuevo) {
+    const panelExistenteId = existente ? await panelSiniestroDeIncidencia(existente.id) : null;
+    if (!panelExistenteId) {
+      if (historialSiniestrosDraft.has(clave)) {
+        historialSiniestrosDraft.get(clave).tipoSiniestro = tipoSiniestroNuevo;
+      } else {
+        const tienda = tiendaEntregaHistorial(tiendaId, entrega);
+        const agencia = tienda ? agenciasCache.find(a => a.id === tienda.agencia_id) : null;
+        await abrirModalFotosBorrador(tiendaId, tienda, agencia, tipoSiniestroNuevo, clave);
+      }
+    }
+  } else if (historialSiniestrosDraft.has(clave)) {
+    await borrarFotosStorage(historialSiniestrosDraft.get(clave).fotosPaths);
+    historialSiniestrosDraft.delete(clave);
+  }
+
+  actualizarFilaHistorial(tiendaId, tr);
+}
+
+// ---------------- Fotos del siniestro en borrador (se suben al momento; el alta en el Panel se difiere) ----------------
+
+let historialFotosPendiente = null; // { tiendaId, clave, tienda, agencia, tipoSiniestro, fotos: [], fotosPaths: [] }
+
+async function abrirModalFotosBorrador(tiendaId, tienda, agencia, tipoSiniestro, clave) {
+  historialFotosPendiente = { tiendaId, clave: clave || claveHist(tiendaId, 'HABITUAL'), tienda, agencia, tipoSiniestro, fotos: [], fotosPaths: [] };
+
+  document.getElementById('historialFotosTitulo').textContent = '📷 Añadir fotos al siniestro';
+  document.getElementById('historialFotosSub').textContent =
+    `${tienda?.nombre || ''} · ${agencia?.nombre || 'Sin agencia'} · ${formatearFechaCorta(new Date(historialInformeActual.fecha + 'T00:00:00'))}. Se añadirá al Panel siniestros al terminar de editar; no se envía nada a la agencia.`;
+  document.getElementById('historialFotosGrid').innerHTML = '';
+  document.getElementById('historialFotosError').style.display = 'none';
+  document.getElementById('historialFotosModalOverlay').classList.add('show');
+}
+
+function pintarFotosPendientesHistorial() {
+  const grid = document.getElementById('historialFotosGrid');
+  grid.innerHTML = (historialFotosPendiente?.fotos || []).map((url, idx) => `
+    <div class="ps-foto-thumb">
+      <img data-src-archivo="${url}" loading="lazy">
+      <button type="button" class="ps-foto-quitar" data-idx="${idx}" title="Quitar">✕</button>
+    </div>`).join('') || `<p class="ps-sin-archivos">Sin fotos todavía.</p>`;
+  firmarImagenesEn(grid);
+  grid.querySelectorAll('.ps-foto-quitar').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const idx = Number(btn.dataset.idx);
+      const [path] = historialFotosPendiente.fotosPaths.splice(idx, 1);
+      historialFotosPendiente.fotos.splice(idx, 1);
+      if (path) borrarFotosStorage([path]);
+      pintarFotosPendientesHistorial();
+    });
+  });
+}
+
+document.getElementById('historialFotosInput')?.addEventListener('change', async (e) => {
+  const files = Array.from(e.target.files || []);
+  if (!files.length || !historialFotosPendiente) return;
+  const errEl = document.getElementById('historialFotosError');
+  errEl.style.display = 'none';
+  try {
+    for (const file of files) {
+      const comprimido = await comprimirImagenParaSubida(file);
+      const path = `panel/historial-borrador-${historialFotosPendiente.tiendaId}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}/${comprimido.name}`;
+      const { error: eUp } = await sb.storage.from('siniestros-fotos').upload(path, comprimido);
+      if (eUp) throw eUp;
+      const { data: pub } = sb.storage.from('siniestros-fotos').getPublicUrl(path);
+      historialFotosPendiente.fotos.push(pub.publicUrl);
+      historialFotosPendiente.fotosPaths.push(path);
+    }
+    pintarFotosPendientesHistorial();
+  } catch (err) {
+    console.error('Error subiendo fotos:', err);
+    errEl.textContent = 'No se pudieron subir las fotos.';
+    errEl.style.display = 'block';
+  } finally {
+    e.target.value = '';
+  }
+});
+
+// Guarda el siniestro (con o sin fotos) en el borrador, no en la BD.
+function guardarBorradorSiniestroDesdeModal() {
+  const p = historialFotosPendiente;
+  if (!p) return;
+  historialSiniestrosDraft.set(p.clave, {
+    tipoSiniestro: p.tipoSiniestro,
+    fotos: p.fotos,
+    fotosPaths: p.fotosPaths,
+    tienda: p.tienda,
+    agencia: p.agencia
+  });
+  historialFotosPendiente = null;
+  document.getElementById('historialFotosModalOverlay').classList.remove('show');
+  renderAcordeonHistorialEditable();
+}
+
+document.getElementById('btnHistorialFotosListo')?.addEventListener('click', guardarBorradorSiniestroDesdeModal);
+document.getElementById('btnHistorialFotosOmitir')?.addEventListener('click', guardarBorradorSiniestroDesdeModal);
+
+// ---------------- Enganche del botón "Editar informe" ----------------
+
+document.getElementById('btnEditarHistorial')?.addEventListener('click', () => {
+  if (historialEditando) cancelarEdicionHistorial();
+  else activarEdicionHistorial();
+});

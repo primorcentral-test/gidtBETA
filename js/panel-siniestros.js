@@ -1,0 +1,2839 @@
+// ---------------------------------------------------------------
+// Panel de siniestros (registro automático — sustituye al Excel)
+// ---------------------------------------------------------------
+// Requiere que ya estén cargados (por orden de <script> en index.html):
+//   sb, escapeHtml, modalAlert, modalConfirm,
+//   formatearFechaCorta, fechaLocalISO           (navegacion.js)
+//   agenciasCache, tiendasCache, cargarAgenciasYTiendas()   (tiendas.js)
+//   sesionActual                                  (auth.js)
+// Debe cargarse DESPUÉS de esos ficheros (y después de siniestros.js).
+//
+// CÓMO SE RELLENA:
+// Cada vez que en "Siniestros del día" se pulsa "✉️ Marcar como
+// enviado", además de marcar el siniestro como ENVIADO se llama a
+// registrarSiniestroEnPanelAutomatico(s, informeHoyCache.fecha)
+// (una única línea añadida en js/siniestros.js, ver instrucciones).
+// Esa función crea la fila en panel_siniestros con lo que ya se sabe
+// (fecha, agencia, tienda, tipo, observaciones, fotos, fecha límite).
+// Lo que todavía no se sabe en ese momento (nº albarán, factura,
+// valor, si está COBRADO...) se completa después abriendo la fila
+// desde esta pantalla.
+// ---------------------------------------------------------------
+
+const BUCKET_FOTOS_PANEL = 'siniestros-fotos';
+const BUCKET_FACTURAS_PANEL = 'siniestros-facturas';
+
+// Supabase Storage solo admite ASCII en la clave (path) del objeto: un
+// nombre de archivo con "ñ", tildes u otros caracteres no-ASCII hace
+// que la subida falle con error "Invalid key" (bug conocido de
+// Supabase). Para el nombre que se guarda y se muestra en la app se
+// respeta el original tal cual; esto solo se usa para construir la
+// ruta de almacenamiento.
+function nombreSeguroParaStorage(nombre) {
+  const base = (nombre || 'archivo').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  return base.replace(/[^a-zA-Z0-9.\-_ ]/g, '_');
+}
+
+let panelCache = [];
+let panelCargado = false;
+let panelFiltros = { texto: '', agenciaId: '', estado: '', tipo: '', origen: '', recogida: '', fechaDesde: '', fechaHasta: '', sinFactura: false, sinAlbaran: false, sinCorreo: false, verCompletados: false, verAnulados: false };
+
+// Paginación de la lista: 30 siniestros por página. Se vuelve a la página 1
+// cada vez que cambian los filtros (ver renderPanelSiniestros).
+const PS_POR_PAGINA = 30;
+let panelPagina = 1;
+let panelFirmaFiltros = '';
+
+// Siniestro con TODO el seguimiento hecho: enviado a la agencia, albarán a
+// facturación, factura emitida, recogida resuelta (si aplica) y cobrado.
+// Estos y los ANULADOS se ocultan por defecto de la lista (se pueden ver
+// con los botones "Completados" / "Anulados" o filtrando por su estado).
+function psSeguimientoCompleto(s) {
+  if (s.estado !== 'COBRADO') return false;
+  const recogidaOk = s.tipo === 'FALTAS' || s.recogida_estado === 'ENVIADO A CENTRAL' || s.recogida_estado === 'RECOGIDO POR AGENCIA';
+  return psEnvioAgenciaResuelto(s) && psFacturacionResuelta(s) && !!s.factura_url && recogidaOk;
+}
+
+// El paso "Albarán enviado a facturación" está resuelto cuando se ha mandado
+// el correo a Facturación o cuando se decidió no mandarlo ("Omitir envío"
+// al adjuntar el albarán), igual que pasa con el envío a la agencia.
+function psFacturacionResuelta(s) {
+  return !!s.enviado_facturacion || !!s.facturacion_omitida_en;
+}
+
+// El paso "Enviado a agencia" está resuelto si se mandó el correo o si se
+// omitió el envío a propósito (botón "Omitir envío"). Mientras no, la fila
+// sale en naranja, cuenta en Tareas pendientes y en el filtro "sin enviar".
+function psEnvioAgenciaResuelto(s) {
+  return !!s.correo_enviado || !!s.envio_omitido_en;
+}
+
+// El correo se mandó a la agencia con un tipo (tipo_enviado) y después el
+// siniestro cambió de tipo (en el informe se añadieron o quitaron roturas
+// o faltas): la agencia todavía no lo sabe. Queda así hasta que se pulsa
+// "Reenviar actualización" o "No reenviar" en el detalle. Los anulados no.
+function psPendienteReenvio(s) {
+  return !!s.correo_enviado && s.estado !== 'ANULADO' && !!s.tipo_enviado && s.tipo !== s.tipo_enviado;
+}
+
+// Fecha (ISO) de la última vez que se escribió a la agencia sobre este
+// siniestro: el primer correo o el último reenvío de actualización.
+function psUltimaComunicacion(s) {
+  const reenvios = (s.reenvios || []).filter(r => r.accion === 'REENVIO');
+  return reenvios.length ? reenvios[reenvios.length - 1].en : s.correo_enviado_en;
+}
+
+// Texto corto del tipo, para los avisos: ROTURA / FALTAS / ROTURAS Y FALTAS
+const PS_TIPO_TXT_AVISO = { ROTURA: 'ROTURA', FALTAS: 'FALTAS', 'FALTAS Y ROTURAS': 'ROTURAS Y FALTAS' };
+function psTipoTxt(tipoPanel) { return PS_TIPO_TXT_AVISO[tipoPanel] || tipoPanel || '—'; }
+let panelActivoId = null;
+
+const PS_ORIGENES = ['', 'ALMACEN', 'WEB', 'RETIRADAS', 'AGENCIA', 'OTRO'];
+const PS_TIPO_DESDE_SINIESTRO = { ROTURA: 'ROTURA', FALTA: 'FALTAS', MIXTO: 'FALTAS Y ROTURAS' };
+// Inversa de la anterior: del tipo tal cual se guarda en panel_siniestros
+// (ROTURA / FALTAS / FALTAS Y ROTURAS) al que espera plantillaSiniestro()
+// de email-plantillas.js (ROTURA / FALTA / MIXTO), para poder reutilizar
+// esa misma plantilla al enviar el correo a la agencia desde aquí.
+const PS_TIPO_A_PLANTILLA = { ROTURA: 'ROTURA', FALTAS: 'FALTA', 'FALTAS Y ROTURAS': 'MIXTO' };
+
+// ---------------- Alta automática (llamada desde siniestros.js) ----------------
+
+// s = fila de siniestrosHoyCache (id, tipo, fotos, fecha_limite, incidencia:{tiendas:{...,agencias:{...}}})
+// fechaInformeISO = informeHoyCache.fecha (fecha de recepción de la mercancía)
+// Se llama desde "Siniestros del día" justo ANTES de mandar el primer
+// correo, para que el siniestro ya tenga su Nº (id de la fila del panel)
+// y vaya en el correo. Si ya existe la fila, la reutiliza. Se crea como
+// "pendiente de enviar": si el correo falla, queda así en el panel (con
+// la franja naranja) y se puede mandar desde allí. Devuelve el id.
+async function psAsegurarFilaPanelAntesDeEnviar(s, fechaInformeISO) {
+  const { data: existente, error: eSel } = await sb.from('panel_siniestros')
+    .select('id').eq('siniestro_id', s.id).maybeSingle();
+  if (eSel) throw eSel;
+  if (existente) return existente.id;
+  const t = s.incidencia?.tiendas || {};
+  const ag = t.agencias || {};
+  const tipoPanel = PS_TIPO_DESDE_SINIESTRO[s.tipo] || 'ROTURA';
+  const { data: nueva, error: eIns } = await sb.from('panel_siniestros').insert({
+    siniestro_id: s.id,
+    fecha: fechaInformeISO,
+    correo_enviado: false,
+    agencia_id: ag.id || null,
+    agencia_nombre: ag.nombre || null,
+    tienda_id: t.id || null,
+    tienda_nombre: t.nombre || null,
+    tipo: tipoPanel,
+    fotos: s.fotos || [],
+    estado: 'PDTE COBRO',
+    recogida_limite: tipoPanel !== 'FALTAS' ? (s.fecha_limite || null) : null,
+    creado_por: sesionActual?.nombre || sesionActual?.usuario || null
+  }).select('id').single();
+  if (eIns) throw eIns;
+  return nueva.id;
+}
+
+// Cuando se quita un siniestro que nunca llegó a enviarse (se quitan sus
+// motivos en el informe), se borra también su fila del panel si se creó
+// para un envío que falló: solo si sigue sin enviar y sin omitir el envío.
+async function psBorrarFilaPanelSinEnviar({ siniestroId = null, incidenciaId = null } = {}) {
+  try {
+    let id = siniestroId;
+    if (!id && incidenciaId) {
+      const { data } = await sb.from('siniestros').select('id').eq('incidencia_id', incidenciaId).maybeSingle();
+      id = data?.id || null;
+    }
+    if (!id) return;
+    const { error } = await sb.from('panel_siniestros').delete()
+      .eq('siniestro_id', id).eq('correo_enviado', false).is('envio_omitido_en', null);
+    if (error) console.error('No se pudo quitar del panel el siniestro sin enviar:', error);
+    else if (panelCargado) cargarPanelSiniestros();
+  } catch (err) {
+    console.error('Error quitando del panel el siniestro sin enviar:', err);
+  }
+}
+
+async function registrarSiniestroEnPanelAutomatico(s, fechaInformeISO) {
+  try {
+    const t = s.incidencia?.tiendas || {};
+    const ag = t.agencias || {};
+
+    // Si ya hay una fila del panel para este siniestro (p. ej. se reabrió y
+    // se reenvió), no se duplica: solo se refresca que el correo se envió.
+    const { data: existente, error: eSel } = await sb
+      .from('panel_siniestros')
+      .select('id')
+      .eq('siniestro_id', s.id)
+      .maybeSingle();
+    if (eSel) throw eSel;
+
+    const tipoPanel = PS_TIPO_DESDE_SINIESTRO[s.tipo] || 'ROTURA';
+    if (existente) {
+      const { error: eUpd } = await sb.from('panel_siniestros')
+        .update({
+          correo_enviado: true,
+          correo_enviado_en: s.enviado_en || new Date().toISOString(),
+          correo_enviado_por: sesionActual?.nombre || sesionActual?.usuario || null,
+          fotos: s.fotos || [],
+          tipo: tipoPanel,
+          tipo_enviado: tipoPanel
+        })
+        .eq('id', existente.id);
+      if (eUpd) throw eUpd;
+    } else {
+      const { error: eIns } = await sb.from('panel_siniestros').insert({
+        siniestro_id: s.id,
+        fecha: fechaInformeISO,
+        correo_enviado: true,
+        correo_enviado_en: s.enviado_en || new Date().toISOString(),
+        correo_enviado_por: sesionActual?.nombre || sesionActual?.usuario || null,
+        agencia_id: ag.id || null,
+        agencia_nombre: ag.nombre || null,
+        tienda_id: t.id || null,
+        tienda_nombre: t.nombre || null,
+        tipo: tipoPanel,
+        tipo_enviado: tipoPanel,
+        fotos: s.fotos || [],
+        estado: 'PDTE COBRO',
+        // La recogida solo aplica si hay algo roto físicamente que recoger
+        // en tienda (ROTURA o FALTAS Y ROTURAS). Una FALTA pura no tiene
+        // mercancía que recoger, así que no se le pone fecha límite.
+        recogida_limite: (PS_TIPO_DESDE_SINIESTRO[s.tipo] || 'ROTURA') !== 'FALTAS' ? (s.fecha_limite || null) : null,
+        creado_por: sesionActual?.nombre || sesionActual?.usuario || null
+      });
+      if (eIns) throw eIns;
+    }
+
+    // Si el Panel siniestros ya está cargado en esta sesión, lo refrescamos
+    if (panelCargado) cargarPanelSiniestros();
+  } catch (err) {
+    console.error('Error registrando el siniestro en el Panel siniestros:', err);
+  }
+}
+
+// ---------------- Carga y render de la tabla ----------------
+
+async function cargarPanelSiniestros() {
+  const tbody = document.getElementById('panelSiniestrosBody');
+  if (!tbody) return;
+  mostrarCargandoGlobal();
+  try {
+    const { data, error } = await sb
+      .from('panel_siniestros')
+      .select('*')
+      .order('fecha', { ascending: false })
+      .order('id', { ascending: false });
+    if (error) throw error;
+    panelCache = data || [];
+    panelCargado = true;
+    rellenarFiltroAgenciasPanel();
+    renderPanelSiniestros();
+    renderPanelKpis();
+  } catch (err) {
+    console.error('Error cargando panel de siniestros:', err);
+    tbody.innerHTML = `<tr><td colspan="12" style="text-align:center; padding:30px; color:var(--grave);">Error al cargar los siniestros.</td></tr>`;
+  } finally {
+    ocultarCargandoGlobal();
+  }
+}
+
+function rellenarFiltroAgenciasPanel() {
+  const sel = document.getElementById('psFiltroAgencia');
+  if (!sel) return;
+  const actual = sel.value;
+  sel.innerHTML = `<option value="">Todas las agencias</option>` + agenciasParaFiltro().map(a => `<option value="${a.id}">${escapeHtml(nombreAgenciaFiltro(a))}</option>`).join('');
+  if (actual) sel.value = actual;
+}
+
+function siniestrosPanelFiltrados({ ignorarVisibilidad = false } = {}) {
+  const f = panelFiltros;
+  const texto = f.texto.trim().toUpperCase();
+  const hoy = new Date(); hoy.setHours(0, 0, 0, 0);
+  return panelCache.filter(s => {
+    if (f.fechaDesde && (s.fecha || '') < f.fechaDesde) return false;
+    if (f.fechaHasta && (s.fecha || '') > f.fechaHasta) return false;
+    if (f.tipo && s.tipo !== f.tipo) return false;
+    if (f.origen === 'SIN_ORIGEN' && s.origen) return false;
+    if (f.origen && f.origen !== 'SIN_ORIGEN' && s.origen !== f.origen) return false;
+    if (f.agenciaId && String(s.agencia_id) !== String(f.agenciaId)) return false;
+    if (f.estado && s.estado !== f.estado) return false;
+    if (f.recogida) {
+      if (f.recogida === 'ENVIADO A CENTRAL' || f.recogida === 'RECOGIDO POR AGENCIA' || f.recogida === 'EN ESPERA DE TIENDA') {
+        if (s.recogida_estado !== f.recogida) return false;
+      } else {
+        // PDTE_DENTRO / PDTE_FUERA: solo tiene sentido para lo que aún no
+        // se ha gestionado y tiene fecha límite (las FALTAS no tienen).
+        if (s.recogida_estado || !s.recogida_limite) return false;
+        const limite = new Date(s.recogida_limite + 'T00:00:00');
+        const fuera = limite < hoy;
+        if (f.recogida === 'PDTE_DENTRO' && fuera) return false;
+        if (f.recogida === 'PDTE_FUERA' && !fuera) return false;
+      }
+    }
+    if (f.sinFactura && s.factura_url) return false;
+    if (f.sinAlbaran && s.albaran_url) return false;
+    // "Sin enviar a agencia" incluye también los modificados después de
+    // enviarlos que aún no se han reenviado (la agencia no lo sabe).
+    if (f.sinCorreo && psEnvioAgenciaResuelto(s) && !psPendienteReenvio(s)) return false;
+    if (texto) {
+      const campo = [s.id, s.agencia_nombre, s.tienda_nombre, s.informacion, s.num_albaran, s.num_factura]
+        .filter(Boolean).join(' ').toUpperCase();
+      if (!campo.includes(texto)) return false;
+    }
+    if (!ignorarVisibilidad) {
+      // Ocultos por defecto (salvo que se pidan con el botón o se filtre
+      // expresamente por ese estado).
+      if (s.estado === 'ANULADO' && !f.verAnulados && f.estado !== 'ANULADO') return false;
+      if (psSeguimientoCompleto(s) && !f.verCompletados && f.estado !== 'COBRADO') return false;
+    }
+    return true;
+  });
+}
+
+function renderPaginacionPanel(total, desde, hasta, totalPaginas) {
+  const cont = document.getElementById('psPaginacion');
+  if (!cont) return;
+  if (!total) { cont.innerHTML = ''; return; }
+  // Números de página visibles: primera, última y las de alrededor de la actual.
+  const nums = [];
+  for (let p = 1; p <= totalPaginas; p++) {
+    if (p === 1 || p === totalPaginas || Math.abs(p - panelPagina) <= 2) nums.push(p);
+    else if (nums[nums.length - 1] !== '…') nums.push('…');
+  }
+  cont.innerHTML = `
+    <span>Mostrando <b>${desde}–${hasta}</b> de <b>${total}</b> siniestro${total === 1 ? '' : 's'}</span>
+    ${totalPaginas > 1 ? `<div class="ps-pag-botones">
+      <button type="button" class="ps-pag-btn" data-pag="${panelPagina - 1}" ${panelPagina === 1 ? 'disabled' : ''} title="Página anterior">‹</button>
+      ${nums.map(n => n === '…' ? '<span class="ps-pag-puntos">…</span>' : `<button type="button" class="ps-pag-btn${n === panelPagina ? ' activa' : ''}" data-pag="${n}">${n}</button>`).join('')}
+      <button type="button" class="ps-pag-btn" data-pag="${panelPagina + 1}" ${panelPagina === totalPaginas ? 'disabled' : ''} title="Página siguiente">›</button>
+    </div>` : ''}`;
+  cont.querySelectorAll('.ps-pag-btn[data-pag]').forEach(btn => btn.addEventListener('click', () => {
+    panelPagina = Number(btn.dataset.pag);
+    renderPanelSiniestros();
+    const scroll = document.querySelector('.ps-tabla-flex');
+    if (scroll) scroll.scrollTop = 0;
+  }));
+}
+
+function actualizarBotonesVisibilidadPanel() {
+  const base = siniestrosPanelFiltrados({ ignorarVisibilidad: true });
+  const nC = base.filter(psSeguimientoCompleto).length;
+  const nA = base.filter(s => s.estado === 'ANULADO').length;
+  const setChip = (id, idNum, n, activo) => {
+    const b = document.getElementById(id);
+    if (!b) return;
+    b.setAttribute('aria-pressed', activo ? 'true' : 'false');
+    document.getElementById(idNum).textContent = n;
+  };
+  setChip('psVerCompletados', 'psNumCompletados', nC, panelFiltros.verCompletados);
+  setChip('psVerAnulados', 'psNumAnulados', nA, panelFiltros.verAnulados);
+}
+
+function psPillTipo(tipo) {
+  const clase = tipo === 'ROTURA' ? 'moderado' : 'grave';
+  return `<span class="pill ${clase}">${escapeHtml(tipo)}</span>`;
+}
+
+function psBadgeEstado(estado) {
+  const clase = estado === 'COBRADO' ? 'cobrado' : estado === 'ANULADO' ? 'anulado' : 'pendiente';
+  return `<span class="ps-badge-estado ${clase}"><i></i>${escapeHtml(estado)}</span>`;
+}
+
+function psFormatearFecha(fechaStr) {
+  if (!fechaStr) return '—';
+  return formatearFechaCorta(new Date(fechaStr + 'T00:00:00'));
+}
+
+// Para timestamps completos (creado_en / actualizado_en), no solo fechas.
+function psFormatearFechaHora(isoStr) {
+  if (!isoStr) return '—';
+  const f = new Date(isoStr);
+  const fechaTxt = formatearFechaCorta(f);
+  const horaTxt = f.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' });
+  return `${fechaTxt} a las ${horaTxt}h`;
+}
+
+function psFormatearValor(v) {
+  if (v === null || v === undefined || v === '') return '—';
+  return Number(v).toLocaleString('es-ES', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' €';
+}
+
+function renderPanelSiniestros() {
+  const tbody = document.getElementById('panelSiniestrosBody');
+  if (!tbody) return;
+  const todas = siniestrosPanelFiltrados();
+  actualizarBotonesVisibilidadPanel();
+
+  // Si han cambiado los filtros, se vuelve a la página 1.
+  const firma = JSON.stringify(panelFiltros);
+  if (firma !== panelFirmaFiltros) { panelFirmaFiltros = firma; panelPagina = 1; }
+  const totalPaginas = Math.max(1, Math.ceil(todas.length / PS_POR_PAGINA));
+  if (panelPagina > totalPaginas) panelPagina = totalPaginas;
+  const inicio = (panelPagina - 1) * PS_POR_PAGINA;
+  const filas = todas.slice(inicio, inicio + PS_POR_PAGINA);
+  renderPaginacionPanel(todas.length, inicio + 1, inicio + filas.length, totalPaginas);
+
+  if (!filas.length) {
+    const ocultos = siniestrosPanelFiltrados({ ignorarVisibilidad: true }).length;
+    tbody.innerHTML = `<tr><td colspan="12" style="text-align:center; padding:30px; color:var(--ink-soft);">
+      ${!panelCache.length
+        ? 'Aquí aparecerán solas las filas en cuanto marques un siniestro como "enviado" en Siniestros del día.'
+        : ocultos
+          ? 'No hay siniestros en curso con estos filtros. Pulsa "Completados" o "Anulados" para ver los que están ocultos.'
+          : 'Ningún siniestro coincide con los filtros.'}
+    </td></tr>`;
+    return;
+  }
+
+  const hoy = new Date(); hoy.setHours(0, 0, 0, 0);
+
+  tbody.innerHTML = filas.map(s => {
+    const tieneFactura = !!s.factura_url;
+    const aplicaRecogida = s.tipo !== 'FALTAS';
+    const limite = (aplicaRecogida && s.recogida_limite) ? new Date(s.recogida_limite + 'T00:00:00') : null;
+    const vencido = limite && limite < hoy && s.estado !== 'COBRADO' && !s.recogida_estado;
+    const recogidaEstadoTexto = s.recogida_estado === 'ENVIADO A CENTRAL' ? '🏢 A central'
+      : s.recogida_estado === 'RECOGIDO POR AGENCIA' ? '📦 Recogido'
+      : s.recogida_estado === 'EN ESPERA DE TIENDA' ? '🏬 Espera tienda'
+      : '';
+    const recogidaTexto = aplicaRecogida
+      ? `${psFormatearFecha(s.recogida_limite)}${recogidaEstadoTexto ? `<br><span class="ps-recogida-mini">${recogidaEstadoTexto}</span>` : ''}`
+      : 'NO APLICA';
+    return `
+      <tr data-id="${s.id}" class="ps-fila${psEnvioAgenciaResuelto(s) ? '' : ' ps-correo-pendiente'}${psPendienteReenvio(s) ? ' ps-fila-reenviar' : ''}${psSeguimientoCompleto(s) ? ' ps-fila-completa' : ''}${s.estado === 'ANULADO' ? ' ps-fila-anulada' : ''}"${psSeguimientoCompleto(s) ? ' title="Seguimiento completado"' : ''}>
+        <td class="ps-col-num"><b>${s.id}</b></td>
+        <td>${psFormatearFecha(s.fecha)}</td>
+        <td><b>${escapeHtml(s.agencia_nombre || '—')}</b></td>
+        <td>${s.tienda_nombre ? escapeHtml(s.tienda_nombre) : '<span class="ps-sin-tienda">Sin tienda</span>'}</td>
+        <td>${escapeHtml(s.origen || '—')}</td>
+        <td>${psPillTipo(s.tipo)}${psEnvioAgenciaResuelto(s) ? '' : ' <span class="ps-correo-pendiente-icono" title="Sin enviar a agencia">📧</span>'}${psPendienteReenvio(s) ? `<br><span class="ps-chip-reenviar" title="Se envió a la agencia como ${escapeHtml(psTipoTxt(s.tipo_enviado))}: falta reenviar la actualización">🔄 Reenviar</span>` : ''}</td>
+        <td class="ps-col-info" title="${escapeHtml(s.informacion || '')}">${escapeHtml(s.informacion || '—')}</td>
+        <td>${escapeHtml(s.num_albaran || '—')}${s.albaran_url ? ' 📄' : ''}</td>
+        <td>${escapeHtml(s.num_factura || '—')}${tieneFactura ? ' 📄' : ''}</td>
+        <td>${psFormatearValor(s.valor)}</td>
+        <td>${psBadgeEstado(s.estado)}</td>
+        <td class="${vencido ? 'ps-vencido' : ''}">${recogidaTexto}</td>
+      </tr>`;
+  }).join('');
+
+  tbody.querySelectorAll('tr[data-id]').forEach(tr => {
+    tr.addEventListener('click', () => abrirModalPanelSiniestro(Number(tr.dataset.id)));
+  });
+}
+
+// Devuelve true si el siniestro tiene una recogida pendiente de verdad
+// (aplica ROTURA/FALTAS Y ROTURAS, tiene fecha límite, y todavía no se ha
+// gestionado ni como "enviado a central" ni como "recogido por agencia").
+// Los anulados no cuentan: ya no hay nada que recoger.
+function psRecogidaPendiente(s) {
+  return s.estado !== 'ANULADO' && s.tipo !== 'FALTAS' && !!s.recogida_limite && !s.recogida_estado;
+}
+
+function renderPanelKpis() {
+  const hoy = new Date(); hoy.setHours(0, 0, 0, 0);
+
+  const pend = panelCache.filter(s => s.estado === 'PDTE COBRO');
+  const totalPend = pend.reduce((acc, s) => acc + (Number(s.valor) || 0), 0);
+
+  const cobrado = panelCache.filter(s => s.estado === 'COBRADO');
+  const totalCobrado = cobrado.reduce((acc, s) => acc + (Number(s.valor) || 0), 0);
+
+  const recogidaPendiente = panelCache.filter(psRecogidaPendiente);
+  const recogidaDentro = recogidaPendiente.filter(s => new Date(s.recogida_limite + 'T00:00:00') >= hoy);
+  const recogidaFuera = recogidaPendiente.filter(s => new Date(s.recogida_limite + 'T00:00:00') < hoy);
+
+  const elCount = document.getElementById('psKpiPendientesCount');
+  const elValor = document.getElementById('psKpiPendientesValor');
+  const elRecDentro = document.getElementById('psKpiRecogidaDentro');
+  const elRecFuera = document.getElementById('psKpiRecogidaFuera');
+  const elCobrado = document.getElementById('psKpiCobrado');
+  if (elCount) elCount.textContent = pend.length;
+  if (elValor) elValor.textContent = psFormatearValor(totalPend);
+  if (elRecDentro) elRecDentro.textContent = recogidaDentro.length;
+  if (elRecFuera) elRecFuera.textContent = recogidaFuera.length;
+  if (elCobrado) elCobrado.textContent = psFormatearValor(totalCobrado);
+}
+
+// Modal genérico de detalle por agencia. filtroFn decide qué filas entran;
+// mostrarValor indica si se enseña el € (pendientes de cobro) o solo el
+// recuento (recogidas).
+function abrirModalDetalle(filtroFn, titulo, mostrarValor) {
+  const filas = panelCache.filter(filtroFn);
+  const m = titulo.match(/^(\S+)\s+(.*)$/);
+  const icono = m ? m[1] : '📋';
+  const texto = m ? m[2] : titulo;
+  const iconoEl = document.getElementById('psDetalleIcono');
+  const tituloEl = document.getElementById('psDetalleTitulo');
+  if (iconoEl) iconoEl.textContent = icono;
+  if (tituloEl) tituloEl.textContent = texto;
+
+  const cont = document.getElementById('psDetalleLista');
+
+  if (!filas.length) {
+    cont.innerHTML = `<p class="ps-sin-archivos">No hay ningún siniestro en este grupo.</p>`;
+  } else {
+    const porAgencia = {};
+    filas.forEach(s => {
+      const clave = s.agencia_nombre || 'Sin agencia';
+      if (!porAgencia[clave]) porAgencia[clave] = { count: 0, valor: 0 };
+      porAgencia[clave].count += 1;
+      porAgencia[clave].valor += Number(s.valor) || 0;
+    });
+
+    const filasHtml = Object.entries(porAgencia)
+      .sort((a, b) => mostrarValor ? b[1].valor - a[1].valor : b[1].count - a[1].count)
+      .map(([nombre, d]) => `
+        <div class="ps-detalle-fila">
+          <div>
+            <div class="agencia">${escapeHtml(nombre)}</div>
+            <div class="count">${d.count} siniestro${d.count === 1 ? '' : 's'}</div>
+          </div>
+          <div class="valor">${mostrarValor ? psFormatearValor(d.valor) : d.count}</div>
+        </div>`).join('');
+
+    const totalCount = filas.length;
+    const totalValor = filas.reduce((acc, s) => acc + (Number(s.valor) || 0), 0);
+
+    cont.innerHTML = filasHtml + `
+      <div class="ps-detalle-fila total">
+        <div>
+          <div class="agencia">Total</div>
+          <div class="count">${totalCount} siniestro${totalCount === 1 ? '' : 's'}</div>
+        </div>
+        <div class="valor">${mostrarValor ? psFormatearValor(totalValor) : totalCount}</div>
+      </div>`;
+  }
+
+  document.getElementById('psDetalleModalOverlay').classList.add('show');
+}
+
+document.getElementById('btnDetallePendientesCount')?.addEventListener('click', () => {
+  abrirModalDetalle(s => s.estado === 'PDTE COBRO', '💰 Pendiente de cobro por agencia', true);
+});
+document.getElementById('btnDetallePendientesValor')?.addEventListener('click', () => {
+  abrirModalDetalle(s => s.estado === 'PDTE COBRO', '💰 Pendiente de cobro por agencia', true);
+});
+document.getElementById('btnDetalleRecogidaDentro')?.addEventListener('click', () => {
+  const hoy = new Date(); hoy.setHours(0, 0, 0, 0);
+  abrirModalDetalle(
+    s => psRecogidaPendiente(s) && new Date(s.recogida_limite + 'T00:00:00') >= hoy,
+    '📦 Recogidas pdte. en límite por agencia', false
+  );
+});
+document.getElementById('btnDetalleRecogidaFuera')?.addEventListener('click', () => {
+  const hoy = new Date(); hoy.setHours(0, 0, 0, 0);
+  abrirModalDetalle(
+    s => psRecogidaPendiente(s) && new Date(s.recogida_limite + 'T00:00:00') < hoy,
+    '📦 Recogidas pdte. cumplidas por agencia', false
+  );
+});
+document.getElementById('btnDetalleCobrado')?.addEventListener('click', () => {
+  abrirModalDetalle(s => s.estado === 'COBRADO', '💰 Cobrado por agencia', true);
+});
+document.getElementById('btnCerrarPsDetalle')?.addEventListener('click', () => {
+  document.getElementById('psDetalleModalOverlay').classList.remove('show');
+});
+document.getElementById('psDetalleModalOverlay')?.addEventListener('click', (e) => {
+  if (e.target.id === 'psDetalleModalOverlay') e.currentTarget.classList.remove('show');
+});
+
+// ---------------- Filtros ----------------
+
+document.getElementById('psFiltroTexto')?.addEventListener('input', (e) => {
+  panelFiltros.texto = e.target.value;
+  renderPanelSiniestros();
+});
+document.getElementById('psFiltroFechaDesde')?.addEventListener('change', (e) => {
+  panelFiltros.fechaDesde = e.target.value;
+  renderPanelSiniestros();
+});
+document.getElementById('psFiltroFechaHasta')?.addEventListener('change', (e) => {
+  panelFiltros.fechaHasta = e.target.value;
+  renderPanelSiniestros();
+});
+document.getElementById('psFiltroAgencia')?.addEventListener('change', (e) => {
+  panelFiltros.agenciaId = e.target.value;
+  renderPanelSiniestros();
+});
+document.getElementById('psFiltroEstado')?.addEventListener('change', (e) => {
+  panelFiltros.estado = e.target.value;
+  renderPanelSiniestros();
+});
+document.getElementById('psFiltroTipo')?.addEventListener('change', (e) => {
+  panelFiltros.tipo = e.target.value;
+  renderPanelSiniestros();
+});
+document.getElementById('psFiltroOrigen')?.addEventListener('change', (e) => {
+  panelFiltros.origen = e.target.value;
+  renderPanelSiniestros();
+});
+document.getElementById('psFiltroRecogida')?.addEventListener('change', (e) => {
+  panelFiltros.recogida = e.target.value;
+  renderPanelSiniestros();
+});
+document.getElementById('psFiltroSinFactura')?.addEventListener('change', (e) => {
+  panelFiltros.sinFactura = e.target.checked;
+  renderPanelSiniestros();
+});
+document.getElementById('psFiltroSinAlbaran')?.addEventListener('change', (e) => {
+  panelFiltros.sinAlbaran = e.target.checked;
+  renderPanelSiniestros();
+});
+document.getElementById('psFiltroSinCorreo')?.addEventListener('change', (e) => {
+  panelFiltros.sinCorreo = e.target.checked;
+  renderPanelSiniestros();
+});
+
+// Aplica de golpe unos filtros (p. ej. desde una tarea pendiente de Inicio:
+// "2 siniestros sin albarán" → abre el Panel con "Sin albarán" marcado).
+// Primero deja todos los filtros como de fábrica, para que no se mezclen
+// con los que hubiera puestos, y luego sincroniza los controles de la
+// barra de filtros para que se vea qué está filtrado.
+function psAplicarFiltros(parciales = {}) {
+  panelFiltros = {
+    texto: '', agenciaId: '', estado: '', tipo: '', origen: '', recogida: '', fechaDesde: '', fechaHasta: '',
+    sinFactura: false, sinAlbaran: false, sinCorreo: false, verCompletados: false, verAnulados: false,
+    ...parciales
+  };
+  const valor = (id, v) => { const el = document.getElementById(id); if (el) el.value = v ?? ''; };
+  const check = (id, v) => { const el = document.getElementById(id); if (el) el.checked = !!v; };
+  valor('psFiltroTexto', panelFiltros.texto);
+  valor('psFiltroFechaDesde', panelFiltros.fechaDesde);
+  valor('psFiltroFechaHasta', panelFiltros.fechaHasta);
+  valor('psFiltroAgencia', panelFiltros.agenciaId);
+  valor('psFiltroEstado', panelFiltros.estado);
+  valor('psFiltroTipo', panelFiltros.tipo);
+  valor('psFiltroOrigen', panelFiltros.origen);
+  valor('psFiltroRecogida', panelFiltros.recogida);
+  check('psFiltroSinFactura', panelFiltros.sinFactura);
+  check('psFiltroSinAlbaran', panelFiltros.sinAlbaran);
+  check('psFiltroSinCorreo', panelFiltros.sinCorreo);
+  if (panelCargado) renderPanelSiniestros();
+}
+
+// Botones "Completados" / "Anulados": muestran u ocultan esos siniestros.
+document.getElementById('psVerCompletados')?.addEventListener('click', () => {
+  panelFiltros.verCompletados = !panelFiltros.verCompletados;
+  renderPanelSiniestros();
+});
+document.getElementById('psVerAnulados')?.addEventListener('click', () => {
+  panelFiltros.verAnulados = !panelFiltros.verAnulados;
+  renderPanelSiniestros();
+});
+
+// ---------------- Alta manual (para lo que no viene del envío automático) ----------------
+
+const PS_SIN_TIENDA = 'SIN_TIENDA';
+
+function rellenarSelectTiendasPsn(agenciaId) {
+  const sel = document.getElementById('psnTienda');
+  const tds = tiendasCache.filter(t => !agenciaId || String(t.agencia_id) === String(agenciaId));
+  // "Sin tienda": para siniestros que no van a ninguna tienda en concreto
+  // (p. ej. un envío de una agencia ocasional). Los correos se adaptan
+  // solos (ver adaptarHtmlSinTienda en email-plantillas.js).
+  sel.innerHTML = `<option value="">— Selecciona tienda —</option>` +
+    `<option value="${PS_SIN_TIENDA}">— Sin tienda (no vinculado a una tienda) —</option>` +
+    tds.map(t => `<option value="${t.id}">${escapeHtml(t.nombre)}</option>`).join('');
+}
+
+async function abrirModalNuevoPanelSiniestro() {
+  if (!agenciasCache.length) await cargarAgenciasYTiendas();
+
+  document.getElementById('psnFecha').value = fechaLocalISO(new Date());
+  document.getElementById('psnTipo').value = 'ROTURA';
+  document.getElementById('psnAgencia').innerHTML = `<option value="">— Selecciona agencia —</option>` +
+    agenciasParaFiltro().map(a => `<option value="${a.id}">${escapeHtml(nombreAgenciaFiltro(a))}</option>`).join('');
+  rellenarSelectTiendasPsn(null);
+  document.getElementById('psnInformacion').value = '';
+  document.getElementById('psnError').style.display = 'none';
+  document.getElementById('psnOrigenAgencia').value = 'no';
+  document.querySelectorAll('#psnOrigenAgenciaToggle .toggle-seg-btn').forEach(b => b.classList.toggle('activo', b.dataset.valor === 'no'));
+
+  document.getElementById('psNuevoModalOverlay').classList.add('show');
+}
+
+document.querySelectorAll('#psnOrigenAgenciaToggle .toggle-seg-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.getElementById('psnOrigenAgencia').value = btn.dataset.valor;
+    document.querySelectorAll('#psnOrigenAgenciaToggle .toggle-seg-btn').forEach(b => b.classList.toggle('activo', b === btn));
+  });
+});
+
+function cerrarModalNuevoPanelSiniestro() {
+  document.getElementById('psNuevoModalOverlay').classList.remove('show');
+}
+
+async function guardarNuevoPanelSiniestro() {
+  const errEl = document.getElementById('psnError');
+  errEl.style.display = 'none';
+
+  const fecha = document.getElementById('psnFecha').value;
+  const tipo = document.getElementById('psnTipo').value;
+  const agenciaId = document.getElementById('psnAgencia').value;
+  const tiendaId = document.getElementById('psnTienda').value;
+  const informacion = document.getElementById('psnInformacion').value.trim();
+
+  if (!fecha || !agenciaId || !tiendaId) {
+    errEl.textContent = 'Rellena al menos la fecha, la agencia y la tienda (o elige «Sin tienda»).';
+    errEl.style.display = 'block';
+    return;
+  }
+
+  const agencia = agenciasCache.find(a => String(a.id) === String(agenciaId));
+  const sinTienda = tiendaId === PS_SIN_TIENDA;
+  const tienda = sinTienda ? null : tiendasCache.find(t => String(t.id) === String(tiendaId));
+
+  // Misma regla que el flujo automático: fecha de recepción + 15 días.
+  // Una FALTA pura no tiene nada físico que recoger, así que no aplica.
+  let recogidaLimite = null;
+  if (tipo !== 'FALTAS') {
+    const limite = new Date(fecha + 'T00:00:00');
+    limite.setDate(limite.getDate() + 15);
+    recogidaLimite = fechaLocalISO(limite);
+  }
+
+  const btn = document.getElementById('btnGuardarPsNuevo');
+  btn.disabled = true;
+  try {
+    const { data, error } = await sb.from('panel_siniestros').insert({
+      fecha,
+      tipo,
+      agencia_id: Number(agenciaId),
+      agencia_nombre: agencia?.nombre || null,
+      tienda_id: sinTienda ? null : Number(tiendaId),
+      tienda_nombre: tienda?.nombre || null,
+      informacion: informacion || null,
+      estado: 'PDTE COBRO',
+      recogida_limite: recogidaLimite,
+      correo_enviado: false,
+      origen: document.getElementById('psnOrigenAgencia').value === 'si' ? 'AGENCIA' : null,
+      creado_por: sesionActual?.nombre || sesionActual?.usuario || null
+    }).select().single();
+    if (error) throw error;
+
+    cerrarModalNuevoPanelSiniestro();
+    await cargarPanelSiniestros();
+    abrirModalPanelSiniestro(data.id); // seguimos rellenando el resto de datos aquí
+  } catch (err) {
+    console.error('Error creando el siniestro manual:', err);
+    errEl.textContent = 'No se pudo crear el siniestro.';
+    errEl.style.display = 'block';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+document.getElementById('btnNuevoPanelSiniestroManual')?.addEventListener('click', abrirModalNuevoPanelSiniestro);
+document.getElementById('btnRefrescarPanelSiniestros')?.addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  const icono = btn.querySelector('.ps-refresh-icon');
+  const inicio = Date.now();
+  btn.disabled = true;
+  icono?.classList.add('ps-girando');
+  try {
+    await cargarPanelSiniestros();
+  } finally {
+    // Al menos una vuelta completa visible, aunque la carga sea instantánea
+    const restante = 800 - (Date.now() - inicio);
+    if (restante > 0) await new Promise(r => setTimeout(r, restante));
+    btn.disabled = false;
+    icono?.classList.remove('ps-girando');
+  }
+});
+document.getElementById('btnCerrarPsNuevo')?.addEventListener('click', cerrarModalNuevoPanelSiniestro);
+document.getElementById('btnCancelarPsNuevo')?.addEventListener('click', cerrarModalNuevoPanelSiniestro);
+document.getElementById('btnGuardarPsNuevo')?.addEventListener('click', guardarNuevoPanelSiniestro);
+// Nota: a propósito NO se cierra al pinchar fuera (fuera del overlay), para
+// no perder por error los datos del formulario ya rellenados — igual que
+// los modales de "Nuevo usuario" / "Editar usuario" (js/usuarios.js), que
+// tampoco se cierran así. Solo cierran los botones ✕, Cancelar y Guardar.
+document.getElementById('psnAgencia')?.addEventListener('change', (e) => rellenarSelectTiendasPsn(e.target.value));
+
+// ---------------- Modal: completar los datos de una fila ----------------
+// (además de crearse solas al enviar un siniestro, o darlas de alta a mano
+// con el botón "Añadir siniestro", este modal es donde se completa todo)
+
+function psSiniestroPorId(id) {
+  return panelCache.find(s => s.id === id);
+}
+
+function rellenarSelectOrigen(valorActual) {
+  const sel = document.getElementById('psOrigen');
+  sel.innerHTML = PS_ORIGENES.map(o =>
+    `<option value="${o}" ${o === (valorActual || '') ? 'selected' : ''}>${o || '— Sin especificar —'}</option>`
+  ).join('');
+}
+
+async function abrirModalPanelSiniestro(id) {
+  const s = psSiniestroPorId(id);
+  if (!s) return;
+  panelActivoId = id;
+  // Quién/cuándo de Estado y Estado de la recogida tal y como están
+  // guardados: si se cancela un cambio sin guardar, se devuelven a esto.
+  psMetaGuardada = psCopiarMeta(s);
+  psBaseDb = psCopiarCamposDb(s);
+
+  document.getElementById('psAgenciaTienda').textContent = `${s.agencia_nombre || 'Sin agencia'} · ${s.tienda_nombre || 'Sin tienda'}`;
+  document.getElementById('psNumeroSiniestro').textContent = `Nº ${s.id}`;
+  document.getElementById('psFechaTexto').textContent = `Fecha de siniestro: ${psFormatearFecha(s.fecha)}`;
+  document.getElementById('psTipoPill').innerHTML = psPillTipo(s.tipo);
+
+  document.getElementById('psActualizadoTexto').textContent = psTextoUltimaModificacion(s.actualizado_por, s.actualizado_en);
+
+  rellenarSelectOrigen(s.origen);
+  document.getElementById('psInformacion').value = s.informacion || '';
+  aplicarEstadoCampoAlbaran(s);
+  aplicarEstadoCampoValor(s);
+  aplicarEstadoCampoFactura(s);
+  document.getElementById('psEstado').value = s.estado || 'PDTE COBRO';
+  document.getElementById('psError').style.display = 'none';
+
+  // Solo hay algo que "recoger" en tienda si es ROTURA o FALTAS Y ROTURAS.
+  // Una FALTA pura no tiene mercancía física, así que no aplica.
+  const aplicaRecogida = s.tipo !== 'FALTAS';
+  document.getElementById('psRecogidaBloque').style.display = aplicaRecogida ? '' : 'none';
+  document.getElementById('psRecogida').value = aplicaRecogida ? (s.recogida_limite || '') : '';
+  document.getElementById('psRecogidaEstado').value = s.recogida_estado || '';
+  document.getElementById('psJustificanteBloque').style.display =
+    (aplicaRecogida && s.recogida_estado === 'RECOGIDO POR AGENCIA') ? '' : 'none';
+
+  pintarFotosModal(s);
+  pintarFacturaModal(s);
+  pintarAlbaranModal(s);
+  pintarJustificanteModal(s);
+  pintarBloqueEnvioAgencia(s);
+  renderSeguimientoPanel(s);
+  psBaseForm = psCamposFormularioPanel();
+  actualizarBotonGuardarPanel();
+
+  document.getElementById('psModalOverlay').classList.add('show');
+}
+
+// Aviso "Pendiente de enviar a la agencia" (bajo la cabecera del detalle del
+// siniestro, con el botón "Enviar a agencia" dentro): solo se muestra
+// mientras el correo de reclamación no se haya enviado todavía. Mientras
+// tanto el detalle lleva además una franja naranja arriba (clase
+// "sin-enviar" en .ps-modal-box), igual que la fila en la tabla. En cuanto
+// se envía (o se omite el envío), todo esto desaparece y la información pasa
+// al paso "Enviado a agencia" del seguimiento (columna de la izquierda).
+// Si el siniestro se modificó después de enviarlo (psPendienteReenvio), el
+// mismo aviso cambia a "Modificado después de enviarlo a la agencia" con
+// los botones "No reenviar" / "Reenviar actualización".
+function pintarBloqueEnvioAgencia(s) {
+  const aviso = document.getElementById('psAvisoAgencia');
+  const btn = document.getElementById('btnPsEnviarAgencia');
+  const btnOmitir = document.getElementById('btnPsOmitirEnvio');
+  const caja = aviso.closest('.ps-modal-box');
+  const ico = aviso.querySelector('.ps-aviso-agencia-ico');
+  const tituloEl = aviso.querySelector('.ps-aviso-agencia-txt b');
+  const pendienteReenvio = psPendienteReenvio(s);
+  aviso.dataset.modo = pendienteReenvio ? 'reenvio' : 'envio';
+  if (psEnvioAgenciaResuelto(s) && !pendienteReenvio) {
+    aviso.style.display = 'none';
+    caja.classList.remove('sin-enviar');
+  } else if (pendienteReenvio) {
+    aviso.style.display = '';
+    caja.classList.add('sin-enviar');
+    if (ico) ico.textContent = '🔄';
+    if (tituloEl) tituloEl.textContent = 'Modificado después de enviarlo a la agencia';
+    const cuando = psFormatearFechaHora(psUltimaComunicacion(s));
+    document.getElementById('psAvisoAgenciaTexto').textContent =
+      `Se envió a ${s.agencia_nombre || 'la agencia'} como ${psTipoTxt(s.tipo_enviado)}${cuando ? ` el ${cuando}` : ''}. Ahora es ${psTipoTxt(s.tipo)} y la agencia todavía no lo sabe.`;
+    btn.disabled = false;
+    btn.title = '';
+    btn.textContent = '✉️ Reenviar actualización';
+    if (btnOmitir) btnOmitir.textContent = '🚫 No reenviar';
+  } else {
+    aviso.style.display = '';
+    caja.classList.add('sin-enviar');
+    if (ico) ico.textContent = '📧';
+    if (tituloEl) tituloEl.textContent = 'Pendiente de enviar a la agencia';
+    if (btnOmitir) btnOmitir.textContent = '🚫 Omitir envío';
+    const sinFotos = !(s.fotos || []).length;
+    btn.disabled = sinFotos;
+    btn.title = sinFotos ? 'Añade al menos 1 foto para poder enviar' : '';
+    btn.textContent = '✉️ Enviar a agencia';
+    const hace = psTextoHaceDias(s.creado_en);
+    document.getElementById('psAvisoAgenciaTexto').textContent = sinFotos
+      ? `Creado ${hace}. Añade al menos 1 foto para poder enviar el correo de reclamación.`
+      : `Creado ${hace} y todavía no se ha mandado el correo de reclamación.`;
+  }
+}
+
+// "hoy", "hace 1 día", "hace 5 días"… contando días naturales (no horas)
+// desde la fecha dada hasta hoy.
+function psTextoHaceDias(fechaIso) {
+  if (!fechaIso) return 'hace un tiempo';
+  const d = new Date(fechaIso);
+  if (isNaN(d)) return 'hace un tiempo';
+  const hoy = new Date();
+  const ini = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const fin = new Date(hoy.getFullYear(), hoy.getMonth(), hoy.getDate());
+  const dias = Math.max(0, Math.round((fin - ini) / 86400000));
+  if (dias === 0) return 'hoy';
+  return dias === 1 ? 'hace 1 día' : `hace ${dias} días`;
+}
+
+// ---------------- Seguimiento del siniestro (columna izquierda) ----------------
+// Muestra, como si fuera el seguimiento de un envío, los pasos por los que
+// va pasando el siniestro: se van marcando en cuanto ocurren de verdad
+// (fecha, hora y usuario), a partir de los mismos campos que ya se guardan
+// en panel_siniestros.
+
+// Junta varias líneas (ya pensadas para mostrarse una debajo de otra, p.ej.
+// fecha/hora en una línea y el usuario en la siguiente) en un solo bloque de
+// detalle, escapando cada una por separado. Las líneas vacías/nulas se
+// descartan, para no dejar un <br> suelto cuando falta un dato.
+function psLineasDetalle(...lineas) {
+  return lineas.filter(l => l !== null && l !== undefined && l !== '').map(l => escapeHtml(l)).join('<br>');
+}
+
+function psPasoSeguimientoHtml({ estado, icono, titulo, detalleHtml, chip, clase }) {
+  return `
+    <div class="step step-${estado}${clase ? ' ' + clase : ''}">
+      <div class="step-nodo">${icono}</div>
+      <div class="step-cuerpo">
+        <p class="step-label">${escapeHtml(titulo)}</p>
+        ${detalleHtml ? `<p class="step-detalle">${detalleHtml}</p>` : ''}
+        ${chip ? `<span class="step-chip">${escapeHtml(chip)}</span>` : ''}
+      </div>
+    </div>`;
+}
+
+function renderSeguimientoPanel(s) {
+  const cont = document.getElementById('psStepper');
+  if (!cont || !s) return;
+
+  const aplicaRecogida = s.tipo !== 'FALTAS';
+  const pasos = [];
+
+  // 1) Siniestro creado — siempre está hecho, es el punto de partida.
+  pasos.push(psPasoSeguimientoHtml({
+    estado: 'done', icono: '✓', titulo: 'Siniestro creado',
+    detalleHtml: s.creado_en ? psLineasDetalle(s.creado_por, psFormatearFechaHora(s.creado_en)) : ''
+  }));
+
+  // 2) Enviado a agencia
+  if (s.correo_enviado) {
+    // Debajo del primer envío, cada comunicación posterior: reenvío de
+    // actualización (verde), "no reenviar" (gris) o anulación (gris).
+    const TXT_ACCION = { REENVIO: '🔄 Reenviado (actualización)', NO_REENVIO: '🚫 Cambio no reenviado', ANULACION: '✉️ Anulación comunicada' };
+    const CLASE_ACCION = { REENVIO: 'reenvio', NO_REENVIO: 'no-reenvio', ANULACION: 'anulacion' };
+    const comunicaciones = (s.reenvios || []).map(r => {
+      const cambio = r.accion !== 'ANULACION' && r.tipo_anterior && r.tipo_nuevo
+        ? `${psTipoTxt(r.tipo_anterior)} → ${psTipoTxt(r.tipo_nuevo)}` : null;
+      return `<span class="step-comunicacion ${CLASE_ACCION[r.accion] || ''}"><b>${escapeHtml(TXT_ACCION[r.accion] || r.accion)}</b><br>${psLineasDetalle(cambio, r.por, psFormatearFechaHora(r.en))}</span>`;
+    }).join('');
+    const pendienteReenvio = psPendienteReenvio(s);
+    pasos.push(psPasoSeguimientoHtml({
+      estado: 'done', icono: '✓', titulo: 'Enviado a agencia',
+      clase: pendienteReenvio ? 'step-reenviar' : '',
+      detalleHtml: psLineasDetalle(
+        s.agencia_nombre ? `Correo a ${s.agencia_nombre}` : null,
+        s.correo_enviado_por,
+        psFormatearFechaHora(s.correo_enviado_en)
+      ) + comunicaciones,
+      chip: pendienteReenvio ? '⏳ Pendiente de reenviar' : ''
+    }));
+  } else if (s.envio_omitido_en) {
+    pasos.push(psPasoSeguimientoHtml({
+      estado: 'done', icono: '–', titulo: 'Envío a agencia omitido',
+      clase: 'step-omitido',
+      detalleHtml: psLineasDetalle(s.envio_omitido_por, psFormatearFechaHora(s.envio_omitido_en)),
+      chip: 'No se envía correo'
+    }));
+  } else {
+    pasos.push(psPasoSeguimientoHtml({
+      estado: 'current', icono: '2', titulo: 'Enviado a agencia',
+      clase: 'step-sin-enviar',
+      detalleHtml: psLineasDetalle('Todavía no se ha enviado el correo a la agencia'),
+      chip: `⏳ Pendiente · ${psTextoHaceDias(s.creado_en)}`
+    }));
+  }
+
+  // 3) Albarán enviado a Facturación
+  // Línea "Albarán adjuntado por …" (quién y cuándo subió el PDF), que se
+  // muestra en todas las variantes del paso en las que ya hay albarán.
+  const lineaAdjuntado = (s.albaran_url && s.albaran_adjuntado_por)
+    ? `Albarán adjuntado por ${s.albaran_adjuntado_por}` + (s.albaran_adjuntado_en ? ` · ${psFormatearFechaHora(s.albaran_adjuntado_en)}` : '')
+    : null;
+  if (s.enviado_facturacion) {
+    pasos.push(psPasoSeguimientoHtml({
+      estado: 'done', icono: '✓', titulo: 'Albarán enviado a facturación',
+      detalleHtml: psLineasDetalle(s.facturacion_enviado_por, psFormatearFechaHora(s.facturacion_enviado_en))
+    }));
+  } else if (s.facturacion_omitida_en) {
+    pasos.push(psPasoSeguimientoHtml({
+      estado: 'done', icono: '–', titulo: 'Envío a facturación omitido',
+      clase: 'step-omitido',
+      detalleHtml: psLineasDetalle(
+        lineaAdjuntado,
+        s.facturacion_omitida_por ? `Omitido por ${s.facturacion_omitida_por}` : null,
+        psFormatearFechaHora(s.facturacion_omitida_en)
+      ),
+      chip: 'No se envía correo'
+    }));
+  } else if (s.albaran_url) {
+    pasos.push(psPasoSeguimientoHtml({
+      estado: psEnvioAgenciaResuelto(s) ? 'current' : 'pending', icono: '3',
+      titulo: 'Albarán enviado a facturación',
+      detalleHtml: psLineasDetalle(lineaAdjuntado, 'Albarán adjuntado, pendiente de enviar a Facturación')
+    }));
+  } else {
+    pasos.push(psPasoSeguimientoHtml({
+      estado: psEnvioAgenciaResuelto(s) ? 'current' : 'pending', icono: '3',
+      titulo: 'Albarán enviado a facturación',
+      detalleHtml: psLineasDetalle('Todavía no se ha enviado el albarán a Facturación')
+    }));
+  }
+
+  // 4) Factura emitida
+  if (s.factura_url) {
+    pasos.push(psPasoSeguimientoHtml({
+      estado: 'done', icono: '✓', titulo: 'Factura emitida',
+      detalleHtml: psLineasDetalle(s.factura_adjuntada_por, psFormatearFechaHora(s.factura_adjuntada_en))
+    }));
+  } else {
+    pasos.push(psPasoSeguimientoHtml({
+      estado: psFacturacionResuelta(s) ? 'current' : 'pending', icono: '4',
+      titulo: 'Factura emitida',
+      detalleHtml: psLineasDetalle('Todavía no se ha adjuntado')
+    }));
+  }
+
+  // Los pasos 5 y 6 solo aplican cuando hay mercancía física que recoger
+  // (una FALTA pura no tiene nada que recoger en tienda). "recogidaCompletada"
+  // se calcula siempre (aunque no aplique recogida) porque el paso 7
+  // "Cobrado" también la usa para decidir si ya le toca estar "current".
+  const recogidaCompletada = s.recogida_estado === 'ENVIADO A CENTRAL' || s.recogida_estado === 'RECOGIDO POR AGENCIA';
+  if (aplicaRecogida) {
+    // "En espera de tienda" NO es un estado terminado: solo indica que ya
+    // hay alguien chateando con la tienda para conseguir la recogida. Solo
+    // "Enviado a central" y "Recogido por agencia" cierran de verdad la
+    // recogida.
+    const enEsperaTienda = s.recogida_estado === 'EN ESPERA DE TIENDA';
+
+    // 5) En tiempo legal 15 días — mientras no se ha completado la
+    // recogida, muestra un chip con los días que quedan (o si ya se ha
+    // pasado el plazo), calculados a partir de la fecha límite de recogida
+    // — también cuando está "en espera de tienda", para que se siga viendo
+    // si ya está fuera de plazo.
+    if (recogidaCompletada) {
+      pasos.push(psPasoSeguimientoHtml({
+        estado: 'done', icono: '✓', titulo: 'En tiempo legal 15 días',
+        detalleHtml: psLineasDetalle('Gestionado dentro de plazo')
+      }));
+    } else if (s.recogida_limite) {
+      const hoy = (typeof fechaLocalISO === 'function') ? fechaLocalISO(new Date()) : new Date().toISOString().slice(0, 10);
+      const hoyDate = new Date(hoy + 'T00:00:00');
+      const limiteDate = new Date(s.recogida_limite + 'T00:00:00');
+      const diasRestantes = Math.round((limiteDate - hoyDate) / 86400000);
+      const fueraDePlazo = diasRestantes < 0;
+
+      let chip;
+      if (fueraDePlazo) {
+        chip = `⚠️ Fuera de plazo (${Math.abs(diasRestantes)} día${Math.abs(diasRestantes) === 1 ? '' : 's'})`;
+      } else if (diasRestantes === 0) {
+        chip = '⏳ Vence hoy';
+      } else {
+        chip = `⏳ Quedan ${diasRestantes} día${diasRestantes === 1 ? '' : 's'}`;
+      }
+
+      pasos.push(psPasoSeguimientoHtml({
+        estado: fueraDePlazo ? 'warn' : 'current', icono: fueraDePlazo ? '!' : '5',
+        titulo: 'En tiempo legal 15 días',
+        detalleHtml: psLineasDetalle(`Recogida límite: ${psFormatearFecha(s.recogida_limite)}`),
+        chip
+      }));
+    } else {
+      pasos.push(psPasoSeguimientoHtml({
+        estado: 'pending', icono: '5', titulo: 'En tiempo legal 15 días',
+        detalleHtml: psLineasDetalle('Todavía sin fecha límite')
+      }));
+    }
+
+    // 6) Recogida de la mercancía
+    if (recogidaCompletada) {
+      const tituloHecho = s.recogida_estado === 'RECOGIDO POR AGENCIA' ? 'Recogido por agencia' : 'Enviado a central';
+      pasos.push(psPasoSeguimientoHtml({
+        estado: 'done', icono: '✓', titulo: tituloHecho,
+        detalleHtml: psLineasDetalle(s.recogida_estado_por, psFormatearFechaHora(s.recogida_estado_en))
+      }));
+    } else if (enEsperaTienda) {
+      // Estado intermedio: alguien ya está gestionando la recogida con la
+      // tienda, para que un compañero que vea la recogida fuera de plazo
+      // sepa que ya se está en ello y no vuelva a preguntar por su cuenta.
+      pasos.push(psPasoSeguimientoHtml({
+        estado: 'current', icono: '6', titulo: 'Recogida de la mercancía',
+        detalleHtml: psLineasDetalle('En espera de respuesta de tienda', s.recogida_estado_por, psFormatearFechaHora(s.recogida_estado_en))
+      }));
+    } else {
+      pasos.push(psPasoSeguimientoHtml({
+        estado: 'pending', icono: '6', titulo: 'Recogida de la mercancía',
+        detalleHtml: psLineasDetalle('Todavía sin gestionar')
+      }));
+    }
+  }
+
+  // 7) Cobrado — último paso del seguimiento: se cierra en cuanto el
+  // siniestro pasa a estado "COBRADO" en el desplegable de Estado. Si en
+  // cambio se marca como "ANULADO", el paso se cierra igualmente pero en
+  // rojo con una X, dejando claro que el cobro ya no va a producirse (no
+  // se queda pendiente/numerado como si aún hubiera algo que gestionar).
+  // El número de icono (cuando ninguno de los dos aplica todavía) se
+  // calcula a partir de los pasos ya añadidos, para que en una FALTA pura
+  // (sin pasos 5 y 6) este paso se numere correctamente como el 5º en vez
+  // de saltar al 7.
+  if (s.estado === 'COBRADO') {
+    pasos.push(psPasoSeguimientoHtml({
+      estado: 'done', icono: '✓', titulo: 'Cobrado',
+      detalleHtml: psLineasDetalle(s.cobrado_por, psFormatearFechaHora(s.cobrado_en))
+    }));
+  } else if (s.estado === 'ANULADO') {
+    pasos.push(psPasoSeguimientoHtml({
+      estado: 'warn', icono: '✕', titulo: 'Cobro anulado',
+      detalleHtml: psLineasDetalle(s.anulado_por, psFormatearFechaHora(s.anulado_en))
+    }));
+  } else {
+    const pasoAnteriorHecho = aplicaRecogida ? recogidaCompletada : !!s.factura_url;
+    pasos.push(psPasoSeguimientoHtml({
+      estado: pasoAnteriorHecho ? 'current' : 'pending', icono: String(pasos.length + 1),
+      titulo: 'Cobrado',
+      detalleHtml: psLineasDetalle('Todavía sin marcar como cobrado')
+    }));
+  }
+
+  cont.innerHTML = pasos.join('');
+}
+
+// Envía el correo de reclamación a la agencia (misma plantilla que usa
+// "Siniestros del día") para un siniestro del Panel siniestros, sea cual
+// sea el día al que corresponda — a diferencia de "Siniestros del día",
+// que solo ve las incidencias de hoy. Marca correo_enviado + fecha/hora +
+// usuario en panel_siniestros al terminar.
+async function enviarCorreoAgenciaDesdePanel() {
+  if (!panelActivoId) return;
+  const s = psSiniestroPorId(panelActivoId);
+  if (!s) return;
+
+  if (!s.agencia_id) {
+    await modalAlert('Este siniestro no tiene agencia asignada.', { titulo: 'Sin agencia' });
+    return;
+  }
+  if (!(s.fotos || []).length) {
+    await modalAlert('Añade al menos 1 foto antes de enviar el correo a la agencia.', { titulo: 'Faltan fotos' });
+    return;
+  }
+
+  const btn = document.getElementById('btnPsEnviarAgencia');
+  const textoOriginal = btn.textContent;
+
+  try {
+    const { data: ag, error: eAg } = await sb.from('agencias').select('emails').eq('id', s.agencia_id).maybeSingle();
+    if (eAg) throw eAg;
+    const emails = ag?.emails || [];
+    if (!emails.length) {
+      await modalAlert('Esta agencia no tiene emails configurados. Añádelos en Gestión → Agencias.', { titulo: 'Sin destinatarios' });
+      return;
+    }
+
+    const ok = await modalConfirm('¿Enviar el correo de reclamación a la agencia ahora?', { titulo: 'Enviar reclamación' });
+    if (!ok) return;
+
+    btn.disabled = true;
+    document.getElementById('cargandoEnvioTexto').textContent = 'ENVIANDO CORREO A AGENCIA';
+    document.getElementById('cargandoEnvioOverlay').classList.add('show');
+
+    const sParaPlantilla = {
+      tipo: PS_TIPO_A_PLANTILLA[s.tipo] || 'ROTURA',
+      fecha_limite: s.recogida_limite,
+      incidencia: { tiendas: { nombre: s.tienda_nombre } },
+      informacion: s.informacion || null // solo se usa si no hay tienda (detalle del envío)
+    };
+    // Si el origen es "AGENCIA" (rotura/falta detectada al reparar un
+    // palet en el propio almacén de la agencia, tras avisarnos ellos),
+    // se usa la plantilla específica para ese caso, con otro asunto y
+    // otro texto — no la de "entrega de mercancía en tienda".
+    const { subject, html, text } = s.origen === 'AGENCIA'
+      ? plantillaSiniestroAgencia({ ...sParaPlantilla, agenciaNombre: s.agencia_nombre }, s.fecha)
+      : plantillaSiniestro(sParaPlantilla, s.fecha);
+
+    await enviarEmail({ to: emails, subject, html, text, attachmentUrls: s.fotos || [] });
+
+    const correoEnviadoEn = new Date().toISOString();
+    const correoEnviadoPor = sesionActual?.nombre || sesionActual?.usuario || null;
+    const { error } = await sb.from('panel_siniestros').update({
+      correo_enviado: true,
+      correo_enviado_en: correoEnviadoEn,
+      correo_enviado_por: correoEnviadoPor,
+      tipo_enviado: s.tipo
+    }).eq('id', panelActivoId);
+    if (error) throw error;
+
+    s.correo_enviado = true;
+    s.correo_enviado_en = correoEnviadoEn;
+    s.correo_enviado_por = correoEnviadoPor;
+    s.tipo_enviado = s.tipo;
+    // Si viene de "Siniestros del día", su fila allí también pasa a enviada
+    // (p. ej. si el primer envío desde allí falló y se ha mandado desde aquí).
+    if (s.siniestro_id) {
+      const { error: eSin } = await sb.from('siniestros').update({
+        estado: 'ENVIADO', enviado_en: correoEnviadoEn, enviado_por: correoEnviadoPor,
+        tipo_enviado: PS_TIPO_A_PLANTILLA[s.tipo] || null
+      }).eq('id', s.siniestro_id).eq('estado', 'PENDIENTE');
+      if (eSin) console.error('No se pudo marcar como enviado el siniestro de origen:', eSin);
+    }
+    pintarBloqueEnvioAgencia(s);
+    renderSeguimientoPanel(s);
+    renderPanelSiniestros();
+  } catch (err) {
+    console.error('Error enviando el correo a la agencia desde el Panel siniestros:', err);
+    document.getElementById('cargandoEnvioOverlay').classList.remove('show');
+    await modalAlert(`No se pudo enviar el correo: ${err.message}`, { titulo: 'Error de envío' });
+  } finally {
+    document.getElementById('cargandoEnvioOverlay').classList.remove('show');
+    btn.disabled = false;
+    btn.textContent = textoOriginal;
+  }
+}
+// El mismo botón sirve para el primer envío y para reenviar la
+// actualización cuando el siniestro cambió de tipo después de enviarlo.
+document.getElementById('btnPsEnviarAgencia')?.addEventListener('click', () => {
+  const s = psSiniestroPorId(panelActivoId);
+  if (s && psPendienteReenvio(s)) reenviarActualizacionDesdePanel();
+  else enviarCorreoAgenciaDesdePanel();
+});
+
+// ---------------- Reenvío de actualización / no reenviar ----------------
+
+// Objeto que esperan las plantillas de email-plantillas.js a partir de una
+// fila del panel, con el tipo indicado (ROTURA / FALTAS / FALTAS Y ROTURAS).
+function psPlantillaDeSiniestro(s, tipoPanel) {
+  return {
+    tipo: PS_TIPO_A_PLANTILLA[tipoPanel] || 'ROTURA',
+    fecha_limite: s.recogida_limite,
+    incidencia: { tiendas: { nombre: s.tienda_nombre } },
+    informacion: s.informacion || null,
+    agenciaNombre: s.agencia_nombre
+  };
+}
+
+async function psEmailsAgencia(agenciaId) {
+  if (!agenciaId) return [];
+  const { data, error } = await sb.from('agencias').select('emails').eq('id', agenciaId).maybeSingle();
+  if (error) throw error;
+  return data?.emails || [];
+}
+
+// Anota en la fila del panel (y en su siniestro de origen) que la agencia
+// ya está al tanto del tipo actual, y guarda la comunicación en el historial.
+async function psRegistrarComunicacion(s, accion) {
+  const entrada = {
+    accion,
+    en: new Date().toISOString(),
+    por: sesionActual?.nombre || sesionActual?.usuario || null,
+    tipo_anterior: s.tipo_enviado || null,
+    tipo_nuevo: s.tipo
+  };
+  const reenvios = [...(s.reenvios || []), entrada];
+  const datos = { reenvios, actualizado_por: entrada.por };
+  if (accion !== 'ANULACION') datos.tipo_enviado = s.tipo;
+  const { error } = await sb.from('panel_siniestros').update(datos).eq('id', s.id);
+  if (error) throw error;
+  Object.assign(s, datos);
+  if (s.siniestro_id && accion !== 'ANULACION') {
+    const { error: eSin } = await sb.from('siniestros')
+      .update({ tipo_enviado: PS_TIPO_A_PLANTILLA[s.tipo] || null }).eq('id', s.siniestro_id);
+    if (eSin) console.error('No se pudo actualizar el siniestro de origen:', eSin);
+  }
+}
+
+function psRefrescarTrasComunicacion(s) {
+  if (panelActivoId === s.id) {
+    pintarBloqueEnvioAgencia(s);
+    renderSeguimientoPanel(s);
+  }
+  renderPanelSiniestros();
+  if (typeof cargarPendienteAtencion === 'function') cargarPendienteAtencion();
+  if (document.getElementById('view-siniestros')?.classList.contains('active') && typeof renderVistaSiniestros === 'function') {
+    renderVistaSiniestros();
+  }
+}
+
+// Si el navegador aún tiene la versión anterior de email-plantillas.js
+// (recién subida una actualización), avisa en vez de fallar a medias.
+async function psPlantillasNuevasCargadas() {
+  if (typeof plantillaActualizacionSiniestro === 'function' && typeof plantillaAnulacionSiniestro === 'function') return true;
+  await modalAlert('GIDT no ha terminado de actualizarse en este equipo. Cierra la app y vuelve a abrirla (o pulsa Ctrl + F5) e inténtalo de nuevo.', { titulo: 'Actualiza la app', icono: '🔄' });
+  return false;
+}
+
+async function reenviarActualizacionDesdePanel() {
+  const s = psSiniestroPorId(panelActivoId);
+  if (!s || !psPendienteReenvio(s)) return;
+  if (!(await psPlantillasNuevasCargadas())) return;
+  const btn = document.getElementById('btnPsEnviarAgencia');
+  const textoOriginal = btn.textContent;
+  try {
+    const emails = await psEmailsAgencia(s.agencia_id);
+    if (!emails.length) {
+      await modalAlert('Esta agencia no tiene emails configurados. Añádelos en Gestión → Agencias.', { titulo: 'Sin destinatarios' });
+      return;
+    }
+    const ok = await modalConfirm(
+      `Se enviará a ${s.agencia_nombre || 'la agencia'} un correo de actualización: se le comunicó como ${psTipoTxt(s.tipo_enviado)} y ahora es ${psTipoTxt(s.tipo)}. Irán adjuntas todas las fotos.`,
+      { titulo: 'Reenviar actualización', icono: '🔄', textoOk: '✉️ Reenviar' }
+    );
+    if (!ok) return;
+
+    btn.disabled = true;
+    document.getElementById('cargandoEnvioTexto').textContent = 'ENVIANDO ACTUALIZACIÓN A AGENCIA';
+    document.getElementById('cargandoEnvioOverlay').classList.add('show');
+
+    const { subject, html, text } = plantillaActualizacionSiniestro(psPlantillaDeSiniestro(s, s.tipo), s.fecha, {
+      tipoAnterior: PS_TIPO_A_PLANTILLA[s.tipo_enviado],
+      comunicadoEn: psUltimaComunicacion(s),
+      agencia: s.origen === 'AGENCIA'
+    });
+    await enviarEmail({ to: emails, subject, html, text, attachmentUrls: s.fotos || [] });
+
+    const tipoAntes = s.tipo_enviado;
+    await psRegistrarComunicacion(s, 'REENVIO');
+    if (typeof registrarAccion === 'function') {
+      registrarAccion('siniestros', 'Reenviar actualización a la agencia', `${psDetalleAuditoria(s)} · ${psTipoTxt(tipoAntes)} → ${psTipoTxt(s.tipo)}`);
+    }
+    psRefrescarTrasComunicacion(s);
+    if (typeof mostrarToast === 'function') mostrarToast(`Actualización enviada a ${s.agencia_nombre || 'la agencia'}`, { posicion: 'abajo' });
+  } catch (err) {
+    console.error('Error reenviando la actualización a la agencia:', err);
+    document.getElementById('cargandoEnvioOverlay').classList.remove('show');
+    await modalAlert(`No se pudo enviar el correo: ${err.message}`, { titulo: 'Error de envío' });
+  } finally {
+    document.getElementById('cargandoEnvioOverlay').classList.remove('show');
+    btn.disabled = false;
+    btn.textContent = textoOriginal;
+  }
+}
+
+// "No reenviar": la agencia ya está al tanto por otra vía (p. ej. por
+// teléfono). Se confirma deslizando y queda en el seguimiento quién y cuándo.
+async function noReenviarDesdePanel() {
+  const s = psSiniestroPorId(panelActivoId);
+  if (!s || !psPendienteReenvio(s)) return;
+  const ok = await modalDeslizarConfirmar(
+    `El siniestro Nº ${s.id} se quedará como ${psTipoTxt(s.tipo)} sin mandar a ${s.agencia_nombre || 'la agencia'} el correo de actualización (se le comunicó como ${psTipoTxt(s.tipo_enviado)}).`,
+    { titulo: '¿No reenviar la actualización?', icono: '🚫', textoDeslizar: 'Desliza para no reenviar', textoHecho: 'No se reenvía' }
+  );
+  if (!ok) return;
+  const btn = document.getElementById('btnPsOmitirEnvio');
+  btn.disabled = true;
+  try {
+    const tipoAntes = s.tipo_enviado;
+    await psRegistrarComunicacion(s, 'NO_REENVIO');
+    if (typeof registrarAccion === 'function') {
+      registrarAccion('siniestros', 'No reenviar actualización a la agencia', `${psDetalleAuditoria(s)} · ${psTipoTxt(tipoAntes)} → ${psTipoTxt(s.tipo)}`);
+    }
+    psRefrescarTrasComunicacion(s);
+  } catch (err) {
+    console.error('Error guardando "no reenviar":', err);
+    await modalAlert(`No se pudo guardar: ${err.message}`, { titulo: 'Error' });
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ---------------- Cambio de tipo tras el envío (desde el informe) ----------------
+
+// Cuando en el informe cambian los motivos de una incidencia cuyo siniestro
+// ya se envió a la agencia, se actualiza el tipo de su fila del panel (y la
+// fecha límite de recogida si pasa a tener o deja de tener roturas).
+// tipoSiniestro: ROTURA / FALTA / MIXTO. Devuelve la fila actualizada o null.
+async function psActualizarTipoDesdeSiniestro(siniestroId, tipoSiniestro, fechaLimiteSiniestro) {
+  const tipoPanel = PS_TIPO_DESDE_SINIESTRO[tipoSiniestro];
+  if (!siniestroId || !tipoPanel) return null;
+  const { data: fila, error: eSel } = await sb.from('panel_siniestros').select('*').eq('siniestro_id', siniestroId).maybeSingle();
+  if (eSel) throw eSel;
+  if (!fila || fila.tipo === tipoPanel) return fila || null;
+
+  const cambios = { tipo: tipoPanel, actualizado_por: sesionActual?.nombre || sesionActual?.usuario || null };
+  if (tipoPanel === 'FALTAS') cambios.recogida_limite = null;
+  else if (!fila.recogida_limite) {
+    let limite = fechaLimiteSiniestro || null;
+    if (!limite && fila.fecha) {
+      const d = new Date(fila.fecha + 'T00:00:00');
+      d.setDate(d.getDate() + 15);
+      limite = fechaLocalISO(d);
+    }
+    cambios.recogida_limite = limite;
+  }
+  const { error } = await sb.from('panel_siniestros').update(cambios).eq('id', fila.id);
+  if (error) throw error;
+  const actualizada = { ...fila, ...cambios };
+  const enCache = panelCache.find(x => x.id === fila.id);
+  if (enCache) Object.assign(enCache, cambios);
+  if (typeof registrarAccion === 'function') {
+    registrarAccion('siniestros', 'Cambio de tipo de siniestro', `${psDetalleAuditoria(actualizada)} · ${psTipoTxt(fila.tipo)} → ${psTipoTxt(tipoPanel)}`);
+  }
+  if (panelCargado) renderPanelSiniestros();
+  return actualizada;
+}
+
+// Aviso "Siniestro actualizado" (Informe del día / edición del histórico):
+// el siniestro ya se había enviado y ahora tiene otro tipo. Ofrece ir al
+// Panel siniestros con el detalle de ese siniestro abierto.
+async function psAvisarSiniestroActualizado(fila) {
+  if (!fila || !psPendienteReenvio(fila)) return;
+  const cuando = psFormatearFechaHora(psUltimaComunicacion(fila));
+  const irAlPanel = await modalConfirm(
+    `${fila.tienda_nombre || 'El siniestro'} ya se había enviado a ${fila.agencia_nombre || 'la agencia'} como ${psTipoTxt(fila.tipo_enviado)}${cuando ? ` el ${cuando}` : ''}. Con este cambio ahora es ${psTipoTxt(fila.tipo)}. ` +
+    'El Panel siniestros ya está actualizado, pero falta mandar a la agencia el correo de actualización.',
+    { titulo: 'Siniestro actualizado', icono: '🔄', textoOk: '🗂️ Ir al Panel siniestros', textoCancel: 'Más tarde' }
+  );
+  if (irAlPanel) await psIrADetalleSiniestro(fila.id);
+}
+
+// Abre el Panel siniestros con el detalle del siniestro indicado.
+async function psIrADetalleSiniestro(id) {
+  if (typeof inicioAbrirSiniestro === 'function') return inicioAbrirSiniestro(id);
+  if (typeof activarVista === 'function') activarVista('panel-siniestros');
+  await cargarPanelSiniestros();
+  abrirModalPanelSiniestro(id);
+}
+
+// ---------------- Omitir envío a la agencia ----------------
+// Para siniestros en los que no hace falta mandar el correo de reclamación
+// (p. ej. ya se ha gestionado por otra vía). Se confirma deslizando, sin
+// vuelta atrás: guarda quién y cuándo, y el paso 2 del seguimiento queda
+// como "Envío a agencia omitido" (en gris). Va dentro del permiso de Panel
+// siniestros (permisos-aviso.js bloquea cualquier .btn de #psModalOverlay).
+async function omitirEnvioAgenciaDesdePanel() {
+  const s = panelCache.find(x => x.id === panelActivoId);
+  if (!s || psEnvioAgenciaResuelto(s)) return;
+
+  const ok = await modalDeslizarConfirmar(
+    `El siniestro Nº ${s.id}${s.agencia_nombre ? ` (${s.agencia_nombre}${s.tienda_nombre ? ' · ' + s.tienda_nombre : ''})` : ''} se quedará sin enviar el correo de reclamación y pasará al siguiente paso.`,
+    { titulo: '¿Omitir el envío a la agencia?', icono: '🚫', textoDeslizar: 'Desliza para omitir el envío', textoHecho: 'Envío omitido' }
+  );
+  if (!ok) return;
+
+  const btn = document.getElementById('btnPsOmitirEnvio');
+  btn.disabled = true;
+  try {
+    const omitidoEn = new Date().toISOString();
+    const omitidoPor = sesionActual?.nombre || sesionActual?.usuario || null;
+    const { error } = await sb.from('panel_siniestros').update({
+      envio_omitido_en: omitidoEn,
+      envio_omitido_por: omitidoPor
+    }).eq('id', s.id);
+    if (error) throw error;
+
+    s.envio_omitido_en = omitidoEn;
+    s.envio_omitido_por = omitidoPor;
+    pintarBloqueEnvioAgencia(s);
+    renderSeguimientoPanel(s);
+    renderPanelSiniestros();
+  } catch (err) {
+    console.error('Error omitiendo el envío a la agencia:', err);
+    await modalAlert(`No se pudo omitir el envío: ${err.message}`, { titulo: 'Error' });
+  } finally {
+    btn.disabled = false;
+  }
+}
+document.getElementById('btnPsOmitirEnvio')?.addEventListener('click', () => {
+  const s = psSiniestroPorId(panelActivoId);
+  if (s && psPendienteReenvio(s)) noReenviarDesdePanel();
+  else omitirEnvioAgenciaDesdePanel();
+});
+
+// Confirmación "deslizar para confirmar" (como el desbloqueo del iPhone):
+// hay que arrastrar el círculo hasta el final; si se suelta antes, vuelve
+// al principio. Con teclado: Enter / flecha derecha sobre el círculo.
+// Devuelve una promesa con true (confirmado) o false (cancelado).
+function modalDeslizarConfirmar(mensaje, { titulo = 'Confirmar', icono = '', textoDeslizar = 'Desliza para confirmar', textoHecho = 'Hecho' } = {}) {
+  const overlay = document.getElementById('deslizarOverlay');
+  const pista = document.getElementById('deslizarPista');
+  const tirador = document.getElementById('deslizarTirador');
+  const relleno = document.getElementById('deslizarRelleno');
+  const texto = document.getElementById('deslizarTexto');
+  const btnCancelar = document.getElementById('deslizarCancelar');
+  const MARGEN = 4;
+
+  document.getElementById('deslizarIcono').textContent = icono;
+  document.getElementById('deslizarIcono').style.display = icono ? '' : 'none';
+  document.getElementById('deslizarTitulo').textContent = titulo;
+  document.getElementById('deslizarMensaje').textContent = mensaje;
+  texto.textContent = textoDeslizar;
+  tirador.textContent = '›';
+  pista.classList.remove('hecho', 'arrastrando', 'volviendo');
+
+  return new Promise(resolve => {
+    let x0 = 0, pos = 0, arrastrando = false, terminado = false;
+    const max = () => pista.clientWidth - tirador.offsetWidth - MARGEN * 2;
+    const pintar = p => {
+      tirador.style.left = (MARGEN + p) + 'px';
+      relleno.style.width = (p + tirador.offsetWidth + MARGEN * 2) + 'px';
+    };
+
+    function cerrar(resultado, retardo = 0) {
+      terminado = true;
+      tirador.removeEventListener('pointerdown', onDown);
+      tirador.removeEventListener('pointermove', onMove);
+      tirador.removeEventListener('pointerup', onUp);
+      tirador.removeEventListener('pointercancel', onUp);
+      tirador.removeEventListener('keydown', onKey);
+      btnCancelar.removeEventListener('click', onCancelar);
+      setTimeout(() => { overlay.classList.remove('show'); resolve(resultado); }, retardo);
+    }
+    function confirmar() {
+      pos = max(); pintar(pos);
+      pista.classList.add('hecho');
+      tirador.textContent = '✓';
+      texto.textContent = textoHecho;
+      cerrar(true, 450);
+    }
+    function onDown(e) {
+      if (terminado) return;
+      arrastrando = true; x0 = e.clientX - pos;
+      pista.classList.add('arrastrando'); pista.classList.remove('volviendo');
+      tirador.setPointerCapture(e.pointerId);
+    }
+    function onMove(e) {
+      if (!arrastrando) return;
+      pos = Math.max(0, Math.min(max(), e.clientX - x0));
+      pintar(pos);
+    }
+    function onUp() {
+      if (!arrastrando) return;
+      arrastrando = false; pista.classList.remove('arrastrando');
+      if (pos >= max() * 0.92) confirmar();
+      else { pista.classList.add('volviendo'); pos = 0; pintar(0); }
+    }
+    function onKey(e) {
+      if (terminado) return;
+      if (e.key === 'Enter' || e.key === 'ArrowRight') { e.preventDefault(); confirmar(); }
+      if (e.key === 'Escape') { e.preventDefault(); cerrar(false); }
+    }
+    function onCancelar() { if (!terminado) cerrar(false); }
+
+    tirador.addEventListener('pointerdown', onDown);
+    tirador.addEventListener('pointermove', onMove);
+    tirador.addEventListener('pointerup', onUp);
+    tirador.addEventListener('pointercancel', onUp);
+    tirador.addEventListener('keydown', onKey);
+    btnCancelar.addEventListener('click', onCancelar);
+
+    overlay.classList.add('show');
+    pintar(0);
+    tirador.focus();
+  });
+}
+
+async function cerrarModalPanelSiniestro() {
+  // Con cambios sin guardar (botón Guardar encendido) se avisa antes de cerrar.
+  if (hayCambiosSinGuardarPanel()) {
+    const salir = await modalConfirm(
+      'Hay cambios sin guardar en este siniestro. Si cierras, se perderán.\n\nPara no perderlos, pulsa Volver y luego Guardar.',
+      { titulo: 'Cambios sin guardar', icono: '⚠️', danger: true, textoOk: 'Salir sin guardar', textoCancel: 'Volver' }
+    );
+    if (!salir) return;
+    // Se descarta lo que no se guardó: quién/cuándo de Estado y Recogida
+    // vuelven a como estaban (los campos se rellenan de nuevo al reabrir).
+    const s = psSiniestroPorId(panelActivoId);
+    if (s && psMetaGuardada) Object.assign(s, psMetaGuardada);
+  }
+  document.getElementById('psModalOverlay').classList.remove('show');
+  panelActivoId = null;
+  psMetaGuardada = null;
+  psBaseForm = null;
+  psBaseDb = null;
+}
+
+// ---------------- Guardado de los campos del formulario ----------------
+// Los campos (origen, información, Nº albarán, importe, Nº factura, estado,
+// recogida límite y estado de la recogida) ya NO se guardan solos: se
+// guardan con el botón 💾 Guardar de la barra de arriba, que está apagado
+// mientras no haya cambios y se enciende (naranja) en cuanto se cambia algo.
+// Al cerrar con cambios pendientes se avisa. Los archivos (fotos, factura,
+// albarán y justificante) se siguen subiendo al momento, como siempre.
+
+// Quién/cuándo de Estado (cobrado/anulado) y de Estado de la recogida tal
+// y como están guardados en la base de datos.
+let psMetaGuardada = null;
+const PS_CAMPOS_META = ['recogida_estado_en', 'recogida_estado_por', 'cobrado_en', 'cobrado_por', 'anulado_en', 'anulado_por'];
+function psCopiarMeta(s) {
+  const m = {};
+  PS_CAMPOS_META.forEach(k => { m[k] = s ? (s[k] ?? null) : null; });
+  return m;
+}
+
+function psTextoUltimaModificacion(por, en) {
+  return por ? `Última modificación por: ${por} · ${psFormatearFechaHora(en)}` : 'Última modificación por: —';
+}
+
+const psNumONull = (v) => (v === null || v === undefined || v === '' || isNaN(Number(v))) ? null : Number(v);
+
+// Valores del formulario, con el mismo formato con el que se guardan.
+function psCamposFormularioPanel() {
+  const s = psSiniestroPorId(panelActivoId);
+  return {
+    origen: document.getElementById('psOrigen').value || null,
+    informacion: document.getElementById('psInformacion').value.trim() || null,
+    num_albaran: document.getElementById('psAlbaran').value.trim() || null,
+    num_factura: document.getElementById('psFacturaNum').value.trim() || null,
+    valor: psNumONull(document.getElementById('psValor').value),
+    estado: document.getElementById('psEstado').value,
+    recogida_limite: (s?.tipo !== 'FALTAS') ? (document.getElementById('psRecogida').value || null) : null,
+    recogida_estado: document.getElementById('psRecogidaEstado').value || null
+  };
+}
+
+
+// Foto de los campos tal y como se ven al abrir (o tras guardar). Se compara
+// con lo que se ve ahora, así un valor antiguo que no está en la lista de un
+// desplegable no cuenta como cambio nada más abrir.
+let psBaseForm = null;
+
+function hayCambiosSinGuardarPanel() {
+  if (!panelActivoId || !psBaseForm) return false;
+  return JSON.stringify(psCamposFormularioPanel()) !== JSON.stringify(psBaseForm);
+}
+
+// Cuando un archivo (factura / albarán) rellena o vacía Nº albarán, importe o
+// Nº factura, eso ya queda guardado: se actualiza la foto para que no cuente
+// como cambio pendiente.
+function psSincronizarBaseCampo(clave) {
+  if (!psBaseForm || !panelActivoId) return;
+  psBaseForm[clave] = psCamposFormularioPanel()[clave];
+  const s = psSiniestroPorId(panelActivoId);
+  if (psBaseDb && s) psBaseDb[clave] = s[clave] ?? null;
+}
+
+// Enciende / apaga el botón Guardar según haya o no cambios. Si se deshace
+// un cambio a mano (se vuelve a poner lo que había), se apaga solo.
+function actualizarBotonGuardarPanel() {
+  const btn = document.getElementById('btnGuardarPsModal');
+  if (!btn || btn.classList.contains('guardando')) return;
+  const hay = hayCambiosSinGuardarPanel();
+  btn.disabled = !hay;
+  btn.classList.toggle('sin-cambios', !hay);
+}
+
+// ---------------- Cambios de otro usuario mientras está abierto ----------------
+// Antes, Guardar mandaba TODOS los campos tal y como se veían en pantalla:
+// si un compañero tenía el siniestro abierto desde antes, al guardar pisaba
+// lo que otro ya había guardado (los campos le salían vacíos). Ahora:
+//  1) Al abrir se apunta cómo estaban los campos en la base de datos
+//     (psBaseDb). Los cambios propios (guardar, adjuntar/quitar archivos)
+//     la mantienen al día.
+//  2) Al guardar se vuelven a leer de la base de datos. Si alguno no
+//     coincide con lo apuntado, es que otro lo ha guardado por detrás: NO
+//     se deja guardar, se avisa y se recarga el siniestro.
+//  3) Si no hay conflicto, solo se guardan los campos que se han cambiado.
+const PS_CAMPOS_CONFLICTO = ['origen', 'informacion', 'num_albaran', 'num_factura', 'valor', 'estado', 'recogida_limite', 'recogida_estado'];
+let psBaseDb = null;
+
+function psCopiarCamposDb(s) {
+  const m = {};
+  PS_CAMPOS_CONFLICTO.forEach(k => { m[k] = s ? (s[k] ?? null) : null; });
+  return m;
+}
+
+// Mismo formato para comparar (el importe puede llegar como texto o número,
+// y '' / null / undefined cuentan igual).
+function psNormCampo(clave, v) {
+  if (clave === 'valor') return psNumONull(v);
+  if (v === null || v === undefined) return null;
+  const t = String(v).trim();
+  return t === '' ? null : t;
+}
+
+function psTextoCuandoOtro(isoStr) {
+  if (!isoStr) return '';
+  const f = new Date(isoStr);
+  const hora = f.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' });
+  const hoy = new Date();
+  const mismoDia = f.toDateString() === hoy.toDateString();
+  return mismoDia ? ` a las ${hora}` : ` el ${formatearFechaCorta(f)} a las ${hora}`;
+}
+
+// Vuelve a leer el siniestro de la base de datos y lo pinta de nuevo en el
+// modal (se pierden los cambios sin guardar de esta pantalla).
+async function psRecargarSiniestroAbierto(id) {
+  const { data, error } = await sb.from('panel_siniestros').select('*').eq('id', id).maybeSingle();
+  if (error) throw error;
+  const idx = panelCache.findIndex(x => x.id === id);
+  if (!data) {
+    if (idx !== -1) panelCache.splice(idx, 1);
+    cerrarModalPanelSiniestroForzado();
+  } else {
+    if (idx !== -1) panelCache[idx] = data; else panelCache.unshift(data);
+    if (panelActivoId === id) await abrirModalPanelSiniestro(id);
+  }
+  renderPanelSiniestros();
+  renderPanelKpis();
+}
+
+// ---------------- Anular: avisar a la agencia y quitar motivos del informe ----------------
+
+const PS_MOTIVOS_TXT = { ROTURA: 'ROTURA CONFIRMADA', FALTAS: 'FALTAS', 'FALTAS Y ROTURAS': 'ROTURA CONFIRMADA y FALTAS' };
+
+// Pregunta (modal rojo con casillas) qué más hacer al pasar a ANULADO uno o
+// varios siniestros del panel. Devuelve null si se cancela, o
+// { avisar, quitar } con lo que se haya marcado.
+//   opciones.mensaje / titulo / textoOk: para usarlo desde Importar cobros.
+async function psPreguntarAnulacion(lista, { mensaje, titulo = 'Anular siniestro', textoOk = '🚫 Anular' } = {}) {
+  const conCorreo = lista.filter(s => s.correo_enviado);
+  const conIncidencia = lista.filter(s => s.siniestro_id || s.incidencia_id);
+  const uno = lista.length === 1 ? lista[0] : null;
+  const opciones = [];
+  if (conCorreo.length) {
+    opciones.push({
+      id: 'avisar',
+      titulo: '✉️ Avisar a la agencia por correo',
+      detalle: uno
+        ? `Se le envió como ${psTipoTxt(uno.tipo_enviado || uno.tipo)}${psUltimaComunicacion(uno) ? ' el ' + psFormatearFechaHora(psUltimaComunicacion(uno)) : ''}. Se le manda un correo diciendo que queda anulado y sin cargo.`
+        : `A las agencias de ${conCorreo.length === 1 ? 'el siniestro que ya se les envió' : `los ${conCorreo.length} siniestros que ya se les enviaron`} se les manda un correo diciendo que quedan anulados y sin cargo.`
+    });
+  }
+  if (conIncidencia.length) {
+    opciones.push({
+      id: 'quitar',
+      titulo: '📋 Quitar los motivos del informe',
+      detalle: uno
+        ? `En el informe del ${psFormatearFecha(uno.fecha)} se quita ${PS_MOTIVOS_TXT[uno.tipo] || 'ROTURA CONFIRMADA / FALTAS'} de ${uno.tienda_nombre || 'la tienda'}. Si tiene otros motivos, se mantienen con sus observaciones.`
+        : `En los informes de esos días se quitan ROTURA CONFIRMADA / FALTAS de ${conIncidencia.length === 1 ? 'su tienda' : `las ${conIncidencia.length} tiendas`}. Si tienen otros motivos, se mantienen con sus observaciones.`
+    });
+  }
+  const texto = mensaje || (uno
+    ? `El siniestro Nº ${uno.id} (${[uno.agencia_nombre, uno.tienda_nombre].filter(Boolean).join(' · ') || 'sin agencia'}) pasará a ANULADO y no se cobrará.${opciones.length ? ' Marca qué más quieres hacer:' : ''}`
+    : `${lista.length} siniestros pasarán a ANULADO y no se cobrarán.${opciones.length ? ' Marca qué más quieres hacer:' : ''}`);
+  const res = await modalConfirmOpciones(texto, opciones, { titulo, icono: '🚫', danger: true, textoOk });
+  if (!res) return null;
+  return { avisar: !!res.avisar, quitar: !!res.quitar };
+}
+
+// Hace lo marcado en psPreguntarAnulacion para un siniestro que YA se ha
+// guardado como ANULADO. Devuelve un texto de error si no se pudo mandar el
+// correo (para avisar al usuario), o null si todo fue bien.
+async function psEjecutarAnulacion(s, { avisar, quitar }) {
+  let errorCorreo = null;
+
+  // La fila de "Siniestros del día" también pasa a ANULADO.
+  if (s.siniestro_id) {
+    const { error } = await sb.from('siniestros').update({ estado: 'ANULADO' }).eq('id', s.siniestro_id);
+    if (error) console.error('No se pudo anular el siniestro de origen:', error);
+  }
+
+  if (avisar && s.correo_enviado) {
+    try {
+      const emails = await psEmailsAgencia(s.agencia_id);
+      if (!emails.length) throw new Error('la agencia no tiene emails configurados');
+      const tipoComunicado = s.tipo_enviado || s.tipo;
+      const { subject, html, text } = plantillaAnulacionSiniestro(psPlantillaDeSiniestro(s, tipoComunicado), s.fecha, {
+        comunicadoEn: psUltimaComunicacion(s),
+        agencia: s.origen === 'AGENCIA'
+      });
+      await enviarEmail({ to: emails, subject, html, text, attachmentUrls: [] });
+      await psRegistrarComunicacion(s, 'ANULACION');
+      if (typeof registrarAccion === 'function') {
+        registrarAccion('siniestros', 'Comunicar anulación a la agencia', psDetalleAuditoria(s));
+      }
+    } catch (err) {
+      console.error('Error enviando la anulación a la agencia:', err);
+      errorCorreo = `Nº ${s.id}${s.tienda_nombre ? ' · ' + s.tienda_nombre : ''}: ${err.message}`;
+    }
+  }
+
+  if (quitar) {
+    try {
+      let incidenciaId = null;
+      if (s.siniestro_id) {
+        const { data: sin } = await sb.from('siniestros').select('incidencia_id').eq('id', s.siniestro_id).maybeSingle();
+        incidenciaId = sin?.incidencia_id || null;
+      }
+      if (!incidenciaId) incidenciaId = s.incidencia_id || null;
+      if (incidenciaId) await quitarMotivosSiniestroDeIncidencia(incidenciaId);
+    } catch (err) {
+      console.error('Error quitando los motivos del informe al anular:', err);
+    }
+  }
+  return errorCorreo;
+}
+
+// Tras anular (con o sin quitar motivos), refresca lo que pueda estar a la
+// vista: informe del día, Siniestros del día, KPIs y Tareas pendientes.
+async function psRefrescarTrasAnulacion() {
+  try {
+    if (typeof cargarIncidenciasHoy === 'function' && typeof informeHoyCache !== 'undefined' && informeHoyCache) {
+      await cargarIncidenciasHoy();
+      if (document.getElementById('view-incidencias')?.classList.contains('active') && typeof renderVistaIncidencias === 'function') renderVistaIncidencias();
+    }
+    if (typeof actualizarKpiSiniestrosDesdeDB === 'function') await actualizarKpiSiniestrosDesdeDB();
+    if (document.getElementById('view-siniestros')?.classList.contains('active') && typeof renderVistaSiniestros === 'function') renderVistaSiniestros();
+    if (typeof cargarPendienteAtencion === 'function') cargarPendienteAtencion();
+  } catch (err) {
+    console.error('Error refrescando tras anular:', err);
+  }
+}
+
+async function guardarCamposPanelAhora() {
+  if (!panelActivoId || !hayCambiosSinGuardarPanel()) return;
+  const id = panelActivoId;
+  const s = psSiniestroPorId(id);
+  const btn = document.getElementById('btnGuardarPsModal');
+  const ahora = new Date().toISOString();
+  const usuarioActual = sesionActual?.nombre || sesionActual?.usuario || null;
+  // Solo los campos que se han cambiado en esta pantalla.
+  const formulario = psCamposFormularioPanel();
+  const cambiados = Object.keys(formulario).filter(k => JSON.stringify(formulario[k]) !== JSON.stringify(psBaseForm?.[k]));
+  const datos = { actualizado_por: usuarioActual };
+  cambiados.forEach(k => { datos[k] = formulario[k]; });
+  // Quién y cuándo se marcó el estado de la recogida (paso "Recogida de
+  // la mercancía" del seguimiento) y COBRADO / ANULADO (paso final): se
+  // anotan al vuelo en la copia local (s) desde los listeners de "change"
+  // de esos desplegables; aquí solo se guardan, y solo si ese desplegable
+  // se ha cambiado.
+  const meta = psCopiarMeta(s);
+  if (cambiados.includes('recogida_estado')) {
+    datos.recogida_estado_en = meta.recogida_estado_en;
+    datos.recogida_estado_por = meta.recogida_estado_por;
+  }
+  if (cambiados.includes('estado')) {
+    datos.cobrado_en = meta.cobrado_en; datos.cobrado_por = meta.cobrado_por;
+    datos.anulado_en = meta.anulado_en; datos.anulado_por = meta.anulado_por;
+  }
+
+  // Al pasar a ANULADO: se pregunta si avisar a la agencia y si quitar los
+  // motivos del informe. Si se cancela, no se guarda nada.
+  let accionesAnular = null;
+  if (s && cambiados.includes('estado') && formulario.estado === 'ANULADO' && (psBaseDb?.estado || s.estado) !== 'ANULADO') {
+    if (s.correo_enviado && !(await psPlantillasNuevasCargadas())) return;
+    accionesAnular = await psPreguntarAnulacion([s]);
+    if (!accionesAnular) return;
+  }
+
+  if (btn) { btn.disabled = true; btn.classList.add('guardando'); }
+  try {
+    // ¿Lo ha guardado otro usuario mientras estaba abierto?
+    const { data: actual, error: eAct } = await sb.from('panel_siniestros')
+      .select(PS_CAMPOS_CONFLICTO.join(', ') + ', actualizado_por, actualizado_en')
+      .eq('id', id).maybeSingle();
+    if (eAct) throw eAct;
+    if (!actual) {
+      await modalAlert(`El siniestro Nº ${id} ya no existe: lo ha borrado otro usuario.`, { titulo: 'Siniestro borrado', icono: '⚠️', danger: true });
+      await psRecargarSiniestroAbierto(id);
+      return;
+    }
+    const modificadoPorOtro = psBaseDb && PS_CAMPOS_CONFLICTO.some(k => psNormCampo(k, actual[k]) !== psNormCampo(k, psBaseDb[k]));
+    if (modificadoPorOtro) {
+      await modalAlert(
+        `${actual.actualizado_por || 'Otro usuario'} guardó cambios en el siniestro Nº ${id}${psTextoCuandoOtro(actual.actualizado_en)}, mientras lo tenías abierto.\n\nPara no borrar lo que ha guardado, tus cambios no se han guardado. Pulsa «Cargar cambios» para ver la versión actual y, si hace falta, vuelve a hacer tu cambio.`,
+        { titulo: 'Siniestro modificado por otro usuario', icono: '⚠️', danger: true, textoOk: 'Cargar cambios' }
+      );
+      await psRecargarSiniestroAbierto(id);
+      return;
+    }
+
+    const { error } = await sb.from('panel_siniestros').update(datos).eq('id', id);
+    if (error) throw error;
+    if (s) {
+      Object.assign(s, datos);
+      s.actualizado_en = ahora;
+      psMetaGuardada = psCopiarMeta(s);
+      if (psBaseDb) cambiados.forEach(k => { psBaseDb[k] = datos[k]; });
+      if (panelActivoId === id) {
+        psBaseForm = psCamposFormularioPanel();
+        document.getElementById('psActualizadoTexto').textContent = psTextoUltimaModificacion(usuarioActual, ahora);
+        renderSeguimientoPanel(s);
+      }
+    }
+    if (accionesAnular && s) {
+      const hayAlgo = accionesAnular.avisar || accionesAnular.quitar;
+      if (hayAlgo) {
+        document.getElementById('cargandoEnvioTexto').textContent = accionesAnular.avisar ? 'ENVIANDO ANULACIÓN A AGENCIA' : 'ANULANDO SINIESTRO';
+        document.getElementById('cargandoEnvioOverlay').classList.add('show');
+      }
+      let errorCorreo = null;
+      try {
+        errorCorreo = await psEjecutarAnulacion(s, accionesAnular);
+      } finally {
+        document.getElementById('cargandoEnvioOverlay').classList.remove('show');
+      }
+      if (panelActivoId === id) renderSeguimientoPanel(s);
+      psRefrescarTrasAnulacion();
+      if (errorCorreo) {
+        await modalAlert(`El siniestro se ha anulado, pero no se pudo mandar el correo a la agencia (${errorCorreo}).`, { titulo: 'Correo no enviado', icono: '⚠️', danger: true });
+      }
+    }
+    renderPanelSiniestros();
+    renderPanelKpis();
+    if (typeof mostrarToast === 'function') mostrarToast(`Siniestro Nº ${id} guardado`, { posicion: 'abajo' });
+  } catch (err) {
+    console.error('Error guardando cambios del panel:', err);
+    await modalAlert('No se pudieron guardar los cambios. Inténtalo de nuevo.', { titulo: 'Error al guardar' });
+  } finally {
+    if (btn) btn.classList.remove('guardando');
+    actualizarBotonGuardarPanel();
+  }
+}
+
+document.getElementById('btnGuardarPsModal')?.addEventListener('click', guardarCamposPanelAhora);
+
+['psOrigen', 'psRecogida'].forEach(id => {
+  document.getElementById(id)?.addEventListener('change', actualizarBotonGuardarPanel);
+});
+['psInformacion', 'psAlbaran', 'psFacturaNum', 'psValor', 'psRecogida'].forEach(id => {
+  document.getElementById(id)?.addEventListener('input', actualizarBotonGuardarPanel);
+});
+
+// El campo "Información" siempre se escribe en mayúsculas (igual que se ve
+// en el resto de la app: motivos, tiendas, agencias…), tanto en el detalle
+// del siniestro como en el alta manual.
+['psInformacion', 'psnInformacion'].forEach(id => {
+  document.getElementById(id)?.addEventListener('input', (e) => {
+    const cursor = e.target.selectionStart;
+    e.target.value = e.target.value.toUpperCase();
+    e.target.setSelectionRange(cursor, cursor);
+  });
+});
+
+document.getElementById('psEstado')?.addEventListener('change', (e) => {
+  const s = psSiniestroPorId(panelActivoId);
+
+  // Anotamos quién y cuándo se marca "COBRADO" o "ANULADO" (para el paso
+  // final del seguimiento); se guarda de verdad enseguida, con el resto de
+  // campos, en el autoguardado de abajo. Solo se rellena el par que
+  // corresponde al valor elegido; el otro se limpia.
+  if (s) {
+    if (e.target.value === (s.estado || 'PDTE COBRO') && psMetaGuardada) {
+      // Se ha vuelto a dejar el estado que ya tenía guardado: quién/cuándo
+      // vuelven a ser los de entonces (no los de ahora).
+      ['cobrado_en', 'cobrado_por', 'anulado_en', 'anulado_por'].forEach(k => { s[k] = psMetaGuardada[k]; });
+    } else if (e.target.value === 'COBRADO') {
+      s.cobrado_en = new Date().toISOString();
+      s.cobrado_por = sesionActual?.nombre || sesionActual?.usuario || null;
+      s.anulado_en = null;
+      s.anulado_por = null;
+    } else if (e.target.value === 'ANULADO') {
+      s.anulado_en = new Date().toISOString();
+      s.anulado_por = sesionActual?.nombre || sesionActual?.usuario || null;
+      s.cobrado_en = null;
+      s.cobrado_por = null;
+    } else {
+      s.cobrado_en = null;
+      s.cobrado_por = null;
+      s.anulado_en = null;
+      s.anulado_por = null;
+    }
+    renderSeguimientoPanel(s);
+  }
+
+  actualizarBotonGuardarPanel();
+});
+
+document.getElementById('psRecogidaEstado')?.addEventListener('change', (e) => {
+  const s = psSiniestroPorId(panelActivoId);
+  const esRecogidoAgencia = e.target.value === 'RECOGIDO POR AGENCIA';
+  document.getElementById('psJustificanteBloque').style.display = esRecogidoAgencia ? '' : 'none';
+
+  // Anotamos quién y cuándo se marca el estado de la recogida (para el
+  // paso "Recogida de la mercancía" del seguimiento); se guarda de verdad
+  // enseguida, con el resto de campos, en el autoguardado de abajo.
+  if (s) {
+    if ((e.target.value || null) === (s.recogida_estado || null) && psMetaGuardada) {
+      s.recogida_estado_en = psMetaGuardada.recogida_estado_en;
+      s.recogida_estado_por = psMetaGuardada.recogida_estado_por;
+    } else if (e.target.value) {
+      s.recogida_estado_en = new Date().toISOString();
+      s.recogida_estado_por = sesionActual?.nombre || sesionActual?.usuario || null;
+    } else {
+      s.recogida_estado_en = null;
+      s.recogida_estado_por = null;
+    }
+    renderSeguimientoPanel(s);
+  }
+
+  actualizarBotonGuardarPanel();
+  // Si se acaba de elegir "Recogido por agencia" y todavía no hay
+  // justificante, abrimos directamente el selector de archivo.
+  if (esRecogidoAgencia && s && !s.justificante_recogida_url) {
+    document.getElementById('psJustificanteInput').click();
+  }
+});
+
+// Borra un archivo del storage detectando el bucket a partir de su propia
+// URL pública (…/object/public/{bucket}/{path}). Es un "best effort": si no
+// se puede borrar no bloqueamos al usuario, solo queda en el log.
+async function borrarDeStoragePorUrlGenerico(url) {
+  if (!url) return;
+  try {
+    const marcador = '/object/public/';
+    const idx = url.indexOf(marcador);
+    if (idx === -1) return;
+    const resto = url.slice(idx + marcador.length); // "{bucket}/{resto-del-path}"
+    const barra = resto.indexOf('/');
+    if (barra === -1) return;
+    const bucket = decodeURIComponent(resto.slice(0, barra));
+    const path = decodeURIComponent(resto.slice(barra + 1));
+    const { error } = await sb.storage.from(bucket).remove([path]);
+    if (error) console.error(`No se pudo borrar del storage (${bucket}/${path}):`, error);
+  } catch (err) {
+    console.error('Error borrando archivo del storage:', err);
+  }
+}
+
+function cerrarModalPanelSiniestroForzado() {
+  document.getElementById('psModalOverlay').classList.remove('show');
+  panelActivoId = null;
+  psMetaGuardada = null;
+  psBaseForm = null;
+  psBaseDb = null;
+}
+
+// ---------------------------------------------------------------
+// Visor de PDF dentro de la app (resumen / factura / albarán / justificante)
+// ---------------------------------------------------------------
+// En vez de abrir una pestaña nueva del navegador (que en la app instalada
+// como PWA saca a la persona fuera de la app), estos documentos se
+// muestran embebidos en un modal propio, con opción de descargar o
+// imprimir directamente desde ahí.
+async function abrirVisorPdfPanel(url, { titulo = '📄 Documento' } = {}) {
+  if (!url) return;
+  document.getElementById('psVisorPdfTitulo').textContent = titulo;
+  const frame = document.getElementById('psVisorPdfFrame');
+  frame.src = 'about:blank';
+  document.getElementById('psVisorPdfOverlay').classList.add('show');
+  // Los archivos guardados en Storage se abren con un enlace temporal
+  // (ver archivos-storage.js). Un blob generado al vuelo (resumen) se
+  // devuelve tal cual.
+  const urlAbrir = await firmarUrlArchivo(url);
+  // Si mientras tanto se ha cerrado el visor, no se carga nada.
+  if (!document.getElementById('psVisorPdfOverlay').classList.contains('show')) return;
+  // "navpanes=0" oculta el panel lateral de miniaturas que el visor de PDF
+  // del navegador abre por defecto (parámetro estándar de los visores
+  // basados en pdf.js/PDFium). El propio visor ya trae sus botones de
+  // descargar e imprimir en la barra de herramientas de arriba.
+  frame.src = urlAbrir + (urlAbrir.includes('#') ? '&' : '#') + 'navpanes=0';
+}
+
+function cerrarVisorPdfPanel() {
+  document.getElementById('psVisorPdfOverlay').classList.remove('show');
+  document.getElementById('psVisorPdfFrame').src = 'about:blank';
+}
+
+document.getElementById('btnCerrarPsVisorPdf')?.addEventListener('click', cerrarVisorPdfPanel);
+document.getElementById('psVisorPdfOverlay')?.addEventListener('click', (e) => {
+  if (e.target === document.getElementById('psVisorPdfOverlay')) cerrarVisorPdfPanel();
+});
+
+// ---------------------------------------------------------------
+// Resumen imprimible del siniestro (etiqueta para pegar en la caja)
+// ---------------------------------------------------------------
+// Genera un PDF apaisado, con texto grande, con lo justo para
+// identificar el bulto: agencia, tienda, fecha del siniestro y
+// fecha límite de recogida. Se abre en el visor embebido de la app.
+function imprimirResumenPanelSiniestro() {
+  if (!panelActivoId) return;
+  const s = psSiniestroPorId(panelActivoId);
+  if (!s) return;
+
+  if (typeof window.jspdf === 'undefined' || typeof window.jspdf.jsPDF !== 'function') {
+    alert('No se ha podido cargar el generador de PDF. Comprueba tu conexión e inténtalo de nuevo.');
+    return;
+  }
+
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a5' });
+  const anchoPag = doc.internal.pageSize.getWidth();
+  const altoPag = doc.internal.pageSize.getHeight();
+  const margen = 20;
+  const centroX = anchoPag / 2;
+
+  // Marco exterior, para recortar y pegar en la caja con guía visual.
+  doc.setDrawColor(0, 0, 0);
+  doc.setLineWidth(2);
+  doc.rect(margen, margen, anchoPag - margen * 2, altoPag - margen * 2);
+
+  // Nº de siniestro, en la esquina superior derecha, sin interferir con el resto de la etiqueta.
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(11);
+  doc.text(`Nº SINIESTRO ${s.id}`, anchoPag - margen - 14, margen + 20, { align: 'right' });
+
+  const agencia = (s.agencia_nombre || 'SIN AGENCIA').toUpperCase();
+  const tienda = (s.tienda_nombre || 'SIN TIENDA').toUpperCase();
+  const fechaSiniestro = psFormatearFecha(s.fecha);
+  const aplicaRecogida = s.tipo !== 'FALTAS';
+  const recogidaLimite = aplicaRecogida ? psFormatearFecha(s.recogida_limite) : 'NO APLICA';
+
+  let y = margen + 50;
+
+  // Agencia y tienda, en grande.
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(36);
+  doc.text(agencia, centroX, y, { align: 'center', maxWidth: anchoPag - margen * 2 - 30 });
+
+  y += 40;
+  doc.setFontSize(24);
+  doc.text(tienda, centroX, y, { align: 'center', maxWidth: anchoPag - margen * 2 - 30 });
+
+  y += 22;
+  doc.setLineWidth(1);
+  doc.line(margen + 24, y, anchoPag - margen - 24, y);
+
+  // Fecha del siniestro.
+  y += 38;
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(13);
+  doc.text('FECHA DEL SINIESTRO', centroX, y, { align: 'center' });
+  y += 32;
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(30);
+  doc.text(fechaSiniestro, centroX, y, { align: 'center' });
+
+  // Fecha límite de recogida.
+  y += 42;
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(13);
+  doc.text('RECOGIDA LÍMITE', centroX, y, { align: 'center' });
+  y += 32;
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(30);
+  doc.text(recogidaLimite, centroX, y, { align: 'center' });
+
+  const nombreArchivo = `siniestro_${(s.agencia_nombre || 'agencia').replace(/\s+/g, '_')}_${(s.tienda_nombre || 'tienda').replace(/\s+/g, '_')}.pdf`;
+
+  abrirVisorPdfPanel(doc.output('bloburl'), { titulo: '📄 Resumen del siniestro', nombreArchivo });
+}
+
+document.getElementById('btnImprimirPanelSiniestro')?.addEventListener('click', imprimirResumenPanelSiniestro);
+
+// Detalle para el registro de auditoría: "Nº 123 · TIENDA" (el nº de
+// siniestro delante, para saber exactamente de cuál se trata).
+function psDetalleAuditoria(s) {
+  const lugar = s?.tienda_nombre || s?.agencia_nombre || '—';
+  return s?.id ? `Nº ${s.id} · ${lugar}` : lugar;
+}
+
+// Motivos que forman el siniestro: ROTURA CONFIRMADA y FALTAS (con su
+// submotivo, p. ej. "ROBO DE CAJAS", que se guarda en el mismo array).
+function psMotivosDelSiniestro() {
+  const subFaltas = (window.SUBMOTIVOS_POR_MOTIVO && window.SUBMOTIVOS_POR_MOTIVO['FALTAS']) || [];
+  return ['ROTURA CONFIRMADA', 'FALTAS', ...subFaltas];
+}
+
+// Quita de una incidencia solo los motivos del siniestro. Si le quedan
+// otros motivos, se actualiza (conservando sus observaciones); si no le
+// queda ninguno, se borra la incidencia entera.
+async function quitarMotivosSiniestroDeIncidencia(incidenciaId) {
+  const { data: inc, error: eSel } = await sb.from('incidencias')
+    .select('id, informe_id, tienda_id, tienda_nombre, agencia_nombre, motivo, observaciones')
+    .eq('id', incidenciaId).maybeSingle();
+  if (eSel) { console.error('No se pudo leer la incidencia asociada:', eSel); return; }
+  if (!inc) return;
+
+  const deSiniestro = psMotivosDelSiniestro();
+  const motivosAntes = inc.motivo || [];
+  const motivosDespues = motivosAntes.filter(m => !deSiniestro.includes(m));
+  const quedanMotivos = motivosDespues.length > 0;
+
+  if (quedanMotivos) {
+    const tipo = typeof calcularTipo === 'function' ? calcularTipo(motivosDespues) : undefined;
+    const cambios = {
+      motivo: motivosDespues,
+      marcada: true,
+      usuario: (typeof sesionActual !== 'undefined' && (sesionActual?.nombre || sesionActual?.usuario)) || null,
+      actualizado_en: new Date().toISOString()
+    };
+    if (tipo !== undefined) cambios.tipo = tipo;
+    const { error } = await sb.from('incidencias').update(cambios).eq('id', inc.id);
+    if (error) { console.error('No se pudieron quitar los motivos del siniestro de la incidencia:', error); return; }
+  } else {
+    const { error } = await sb.from('incidencias').delete().eq('id', inc.id);
+    if (error) { console.error('No se pudo borrar la incidencia asociada:', error); return; }
+  }
+
+  // Si el informe de ese día ya se había enviado a las agencias, se deja
+  // constancia en el registro de cambios (igual que al quitar motivos a mano).
+  if (typeof registrarCambioInformeSiEnviado === 'function' && inc.informe_id) {
+    try {
+      const { data: informe } = await sb.from('informes_diarios')
+        .select('id, fecha, informe_enviado').eq('id', inc.informe_id).maybeSingle();
+      registrarCambioInformeSiEnviado(informe, {
+        tiendaId: inc.tienda_id,
+        tiendaNombre: inc.tienda_nombre,
+        agenciaNombre: inc.agencia_nombre,
+        motivosAntes,
+        motivosDespues,
+        observacionesAntes: inc.observaciones || '',
+        observacionesDespues: quedanMotivos ? (inc.observaciones || '') : ''
+      });
+    } catch (err) {
+      console.error('No se pudo registrar el cambio en el informe:', err);
+    }
+  }
+}
+
+async function eliminarPanelSiniestro() {
+  if (!panelActivoId) return;
+  const s = psSiniestroPorId(panelActivoId);
+
+  const ok = await modalConfirm(
+    'Se borrará todo lo relacionado con este siniestro: fotos, factura, albarán y el registro original de "Siniestros del día". En la incidencia del informe del día en que se creó (aunque no sea hoy) solo se quitarán los motivos del siniestro (ROTURA CONFIRMADA / FALTAS); si tenía otros motivos, la incidencia se mantiene con ellos y con sus observaciones. Esta acción no se puede deshacer.',
+    { titulo: 'CONFIRMAR BORRAR SINIESTRO', danger: true, textoOk: 'Sí, borrar definitivamente' }
+  );
+  if (!ok) return;
+
+  try {
+    // Reunimos todas las URLs de archivos a borrar del storage: las del
+    // panel (fotos, factura, albarán) y, si hay un siniestro original
+    // enlazado, también las suyas propias (por si se le añadieron fotos
+    // después de haberse creado la fila del panel).
+    const urls = [...(s?.fotos || [])];
+    if (s?.factura_url) urls.push(s.factura_url);
+    if (s?.albaran_url) urls.push(s.albaran_url);
+    if (s?.justificante_recogida_url) urls.push(s.justificante_recogida_url);
+
+    if (s?.siniestro_id) {
+      const { data: sinOriginal } = await sb.from('siniestros').select('fotos, incidencia_id').eq('id', s.siniestro_id).maybeSingle();
+      (sinOriginal?.fotos || []).forEach(u => { if (!urls.includes(u)) urls.push(u); });
+
+      await Promise.all(urls.map(borrarDeStoragePorUrlGenerico));
+
+      // Se borra el siniestro de verdad y, en la incidencia del informe del
+      // día en que se creó (esté hoy o en cualquier otro día), se quitan
+      // solo los motivos del siniestro (ROTURA CONFIRMADA / FALTAS y su
+      // submotivo). Si le quedan otros motivos, la incidencia se mantiene
+      // con ellos y con sus observaciones; si no le queda ninguno, se borra
+      // entera.
+      const { error: eSin } = await sb.from('siniestros').delete().eq('id', s.siniestro_id);
+      if (eSin) console.error('No se pudo borrar el siniestro original:', eSin);
+
+      if (sinOriginal?.incidencia_id) {
+        await quitarMotivosSiniestroDeIncidencia(sinOriginal.incidencia_id);
+      }
+    } else {
+      await Promise.all(urls.map(borrarDeStoragePorUrlGenerico));
+    }
+
+    const { error } = await sb.from('panel_siniestros').delete().eq('id', panelActivoId);
+    if (error) throw error;
+
+    if (typeof registrarAccion === 'function') {
+      registrarAccion('siniestros', 'Borrar siniestro', `${psDetalleAuditoria(s)}${s?.fecha ? ' — ' + psFormatearFecha(s.fecha) : ''}`);
+    }
+
+    cerrarModalPanelSiniestroForzado();
+    await cargarPanelSiniestros();
+  } catch (err) {
+    console.error('Error eliminando siniestro:', err);
+    await modalAlert('No se pudo eliminar el siniestro.', { titulo: 'Error' });
+  }
+}
+
+// ---------------- Fotos (carpeta) ----------------
+
+function pintarFotosModal(s) {
+  const grid = document.getElementById('psFotosGrid');
+  const fotos = s.fotos || [];
+  grid.innerHTML = fotos.map((url, idx) => `
+    <div class="ps-foto-thumb">
+      <img data-src-archivo="${url}" loading="lazy" data-abrir-foto="${url}" style="cursor:zoom-in;">
+      <button type="button" class="ps-foto-quitar" data-idx="${idx}" title="Borrar foto">🗑️</button>
+    </div>`).join('') || `<p class="ps-sin-archivos">Sin fotos todavía.</p>`;
+  firmarImagenesEn(grid);
+
+  grid.querySelectorAll('[data-abrir-foto]').forEach(img => {
+    img.addEventListener('click', () => abrirLightboxPanel(img.dataset.abrirFoto));
+  });
+  grid.querySelectorAll('.ps-foto-quitar').forEach(btn => {
+    btn.addEventListener('click', () => quitarFotoPanel(Number(btn.dataset.idx)));
+  });
+}
+
+async function abrirLightboxPanel(url) {
+  const img = document.getElementById('psLightboxImg');
+  const overlay = document.getElementById('psLightboxOverlay');
+  img.src = '';
+  overlay.classList.add('show');
+  // Enlace temporal recién pedido al abrir (ver archivos-storage.js), por
+  // si la miniatura lleva tiempo en pantalla y el suyo ya ha caducado.
+  const urlAbrir = await firmarUrlArchivo(url);
+  if (overlay.classList.contains('show')) img.src = urlAbrir;
+}
+function cerrarLightboxPanel() {
+  document.getElementById('psLightboxOverlay').classList.remove('show');
+  document.getElementById('psLightboxImg').src = '';
+}
+document.getElementById('btnCerrarPsLightbox')?.addEventListener('click', cerrarLightboxPanel);
+document.getElementById('psLightboxOverlay')?.addEventListener('click', (e) => {
+  if (e.target.id === 'psLightboxOverlay') cerrarLightboxPanel();
+});
+
+// Si el panel viene de un siniestro automático (tiene siniestro_id), las
+// fotos que se añaden/quitan aquí se reflejan también en el siniestro
+// original, para que "Siniestros del día" y el "Historial" se vean igual.
+async function sincronizarFotosConSiniestroOriginal(s) {
+  if (!s?.siniestro_id) return;
+  try {
+    const { error } = await sb.from('siniestros').update({ fotos: s.fotos || [] }).eq('id', s.siniestro_id);
+    if (error) console.error('No se pudo sincronizar las fotos con el siniestro original:', error);
+  } catch (err) {
+    console.error('Error sincronizando fotos con el siniestro original:', err);
+  }
+}
+
+document.getElementById('psFotosInput')?.addEventListener('change', async (e) => {
+  const files = Array.from(e.target.files || []);
+  if (!files.length || !panelActivoId) return;
+  const errEl = document.getElementById('psFotosError');
+  errEl.style.display = 'none';
+  try {
+    document.getElementById('cargandoEnvioTexto').textContent = files.length > 1 ? 'Subiendo fotos…' : 'Subiendo foto…';
+    document.getElementById('cargandoEnvioOverlay').classList.add('show');
+
+    const s = psSiniestroPorId(panelActivoId);
+    const urls = [];
+    for (const file of files) {
+      const comprimido = await comprimirImagenParaSubida(file);
+      const path = `panel/${panelActivoId}/${Date.now()}-${nombreSeguroParaStorage(comprimido.name)}`;
+      const { error: eUp } = await sb.storage.from(BUCKET_FOTOS_PANEL).upload(path, comprimido);
+      if (eUp) throw eUp;
+      const { data: pub } = sb.storage.from(BUCKET_FOTOS_PANEL).getPublicUrl(path);
+      urls.push(pub.publicUrl);
+    }
+    const fotosActualizadas = [...(s.fotos || []), ...urls];
+    const { error: eDb } = await sb.from('panel_siniestros').update({ fotos: fotosActualizadas, actualizado_por: sesionActual?.nombre || sesionActual?.usuario || null }).eq('id', panelActivoId);
+    if (eDb) throw eDb;
+    s.fotos = fotosActualizadas;
+    pintarFotosModal(s);
+    pintarBloqueEnvioAgencia(s);
+    renderPanelSiniestros();
+    await sincronizarFotosConSiniestroOriginal(s);
+  } catch (err) {
+    console.error('Error subiendo fotos:', err);
+    errEl.textContent = 'No se pudieron subir las fotos.';
+    errEl.style.display = 'block';
+  } finally {
+    document.getElementById('cargandoEnvioOverlay').classList.remove('show');
+    e.target.value = '';
+  }
+});
+
+// Borra un archivo del storage a partir de su URL pública (…/object/public/{bucket}/{path}).
+// Es un "best effort": si no se puede borrar (o la URL no tiene ese formato)
+// no bloqueamos al usuario, solo lo dejamos en el log.
+async function borrarDeStoragePorUrl(bucket, url) {
+  if (!url) return;
+  try {
+    const marcador = `/object/public/${bucket}/`;
+    const idx = url.indexOf(marcador);
+    if (idx === -1) return;
+    const path = decodeURIComponent(url.slice(idx + marcador.length));
+    const { error } = await sb.storage.from(bucket).remove([path]);
+    if (error) console.error(`No se pudo borrar del storage (${bucket}/${path}):`, error);
+  } catch (err) {
+    console.error('Error borrando archivo del storage:', err);
+  }
+}
+
+async function quitarFotoPanel(idx) {
+  const s = psSiniestroPorId(panelActivoId);
+  if (!s) return;
+
+  const ok = await modalConfirm('¿Seguro que quieres borrar esta foto del siniestro?', { titulo: 'Borrar foto', danger: true, textoOk: 'Borrar' });
+  if (!ok) return;
+
+  const urlAEliminar = (s.fotos || [])[idx];
+  const fotosActualizadas = (s.fotos || []).filter((_, i) => i !== idx);
+  try {
+    const { error } = await sb.from('panel_siniestros').update({ fotos: fotosActualizadas, actualizado_por: sesionActual?.nombre || sesionActual?.usuario || null }).eq('id', panelActivoId);
+    if (error) throw error;
+    s.fotos = fotosActualizadas;
+    pintarFotosModal(s);
+    pintarBloqueEnvioAgencia(s);
+    renderPanelSiniestros();
+    await sincronizarFotosConSiniestroOriginal(s);
+    await borrarDeStoragePorUrl(BUCKET_FOTOS_PANEL, urlAEliminar);
+    if (typeof registrarAccion === 'function') {
+      registrarAccion('siniestros', 'Borrar foto de siniestro', psDetalleAuditoria(s));
+    }
+  } catch (err) {
+    console.error('Error quitando foto:', err);
+  }
+}
+
+// ---------------- Factura ----------------
+
+function pintarFacturaModal(s) {
+  const cont = document.getElementById('psFacturaZona');
+  if (s.factura_url) {
+    cont.innerHTML = `
+      <div class="archivo-fila-pdf">
+        <button type="button" class="ps-factura-chip" id="btnVerFactura">📄 ${escapeHtml(s.factura_nombre || 'Ver factura')}</button>
+        <div class="archivo-iconos">
+          <button type="button" class="icono-accion" id="btnQuitarFactura" title="Quitar factura">🗑️</button>
+        </div>
+      </div>`;
+    document.getElementById('btnVerFactura').addEventListener('click', () =>
+      abrirVisorPdfPanel(s.factura_url, { titulo: '📄 Factura', nombreArchivo: s.factura_nombre || 'factura.pdf' }));
+    document.getElementById('btnQuitarFactura').addEventListener('click', quitarFacturaPanel);
+  } else {
+    cont.innerHTML = `
+      <p class="ps-sin-archivos">Todavía no se ha adjuntado la factura.</p>
+      <button type="button" class="btn" id="btnAdjuntarFactura" style="cursor:pointer;">📎 Adjuntar factura</button>`;
+    document.getElementById('btnAdjuntarFactura').addEventListener('click', () => document.getElementById('psFacturaInput').click());
+  }
+}
+
+document.getElementById('psFacturaInput')?.addEventListener('change', async (e) => {
+  const file = e.target.files?.[0];
+  if (!file || !panelActivoId) return;
+  const errEl = document.getElementById('psFacturaError');
+  errEl.style.display = 'none';
+  try {
+    document.getElementById('cargandoEnvioTexto').textContent = 'Subiendo factura…';
+    document.getElementById('cargandoEnvioOverlay').classList.add('show');
+
+    const comprimido = await comprimirImagenParaSubida(file);
+    const path = `panel/${panelActivoId}/${Date.now()}-${nombreSeguroParaStorage(comprimido.name)}`;
+    const { error: eUp } = await sb.storage.from(BUCKET_FACTURAS_PANEL).upload(path, comprimido);
+    if (eUp) throw eUp;
+    const { data: pub } = sb.storage.from(BUCKET_FACTURAS_PANEL).getPublicUrl(path);
+
+    // Intentamos leer el TOTAL IMPORTE del propio PDF (última página,
+    // abajo del todo). Si el campo Valor ya tenía algo escrito a mano,
+    // no lo pisamos.
+    const campoValor = document.getElementById('psValor');
+    let totalDetectado = null;
+    if (!campoValor.value.trim()) {
+      totalDetectado = await extraerTotalFacturaDePdf(file);
+    }
+
+    const campoFacturaNum = document.getElementById('psFacturaNum');
+    let numeroFacturaDetectado = null;
+    if (!campoFacturaNum.value.trim()) {
+      numeroFacturaDetectado = await extraerNumFacturaDePdf(file);
+    }
+
+    const facturaAdjuntadaEn = new Date().toISOString();
+    const facturaAdjuntadaPor = sesionActual?.nombre || sesionActual?.usuario || null;
+    const cambios = {
+      factura_url: pub.publicUrl, factura_nombre: comprimido.name,
+      factura_adjuntada_en: facturaAdjuntadaEn, factura_adjuntada_por: facturaAdjuntadaPor,
+      actualizado_por: facturaAdjuntadaPor
+    };
+    if (totalDetectado !== null) cambios.valor = totalDetectado;
+    if (numeroFacturaDetectado) cambios.num_factura = numeroFacturaDetectado;
+
+    const { error: eDb } = await sb.from('panel_siniestros').update(cambios).eq('id', panelActivoId);
+    if (eDb) throw eDb;
+    const s = psSiniestroPorId(panelActivoId);
+    s.factura_url = pub.publicUrl;
+    s.factura_nombre = comprimido.name;
+    s.factura_adjuntada_en = facturaAdjuntadaEn;
+    s.factura_adjuntada_por = facturaAdjuntadaPor;
+    if (totalDetectado !== null) s.valor = totalDetectado;
+    if (numeroFacturaDetectado) s.num_factura = numeroFacturaDetectado;
+    // Siempre (se haya detectado algo o no): así, si la lectura automática
+    // falla, el campo se desbloquea para escribirlo a mano en vez de
+    // quedarse gris y bloqueado como si todavía no hubiera factura.
+    aplicarEstadoCampoValor(s);
+    aplicarEstadoCampoFactura(s);
+    pintarFacturaModal(s);
+    renderSeguimientoPanel(s);
+    renderPanelSiniestros();
+    if (totalDetectado !== null) renderPanelKpis();
+  } catch (err) {
+    console.error('Error subiendo factura:', err);
+    errEl.textContent = 'No se pudo subir la factura.';
+    errEl.style.display = 'block';
+  } finally {
+    document.getElementById('cargandoEnvioOverlay').classList.remove('show');
+    e.target.value = '';
+  }
+});
+
+async function quitarFacturaPanel() {
+  const ok = await modalConfirm('¿Quitar la factura adjunta? También se vaciarán el importe y el nº de factura detectados.', { titulo: 'Quitar factura', danger: true, textoOk: 'Quitar' });
+  if (!ok) return;
+  const s = psSiniestroPorId(panelActivoId);
+  const urlAEliminar = s?.factura_url;
+  try {
+    const { error } = await sb.from('panel_siniestros').update({ factura_url: null, factura_nombre: null, valor: null, num_factura: null, factura_adjuntada_en: null, factura_adjuntada_por: null, actualizado_por: sesionActual?.nombre || sesionActual?.usuario || null }).eq('id', panelActivoId);
+    if (error) throw error;
+    if (s) { s.factura_url = null; s.factura_nombre = null; s.valor = null; s.num_factura = null; s.factura_adjuntada_en = null; s.factura_adjuntada_por = null; }
+    pintarFacturaModal(s);
+    if (s) aplicarEstadoCampoValor(s); // vacía y libera el campo Valor para poder editarlo a mano
+    if (s) aplicarEstadoCampoFactura(s); // vacía y libera el campo Nº Factura para poder editarlo a mano
+    if (s) renderSeguimientoPanel(s);
+    renderPanelSiniestros();
+    renderPanelKpis();
+    await borrarDeStoragePorUrl(BUCKET_FACTURAS_PANEL, urlAEliminar);
+    if (typeof registrarAccion === 'function') {
+      registrarAccion('siniestros', 'Quitar factura de siniestro', psDetalleAuditoria(s));
+    }
+  } catch (err) {
+    console.error('Error quitando factura:', err);
+  }
+}
+
+// ---------------- Albarán (PDF) ----------------
+
+// El campo Nº Albarán empieza BLOQUEADO (no se escribe "a ojo"): solo se
+// rellena cuando se detecta el número al subir el PDF del albarán. Solo
+// entonces aparece el candado + el lápiz de "editar manualmente", por si la
+// lectura automática fallase alguna vez — mientras no se haya subido nada,
+// no hay nada que editar, así que no se ofrece esa opción.
+function aplicarEstadoCampoAlbaran(s) {
+  const wrap = document.getElementById('psAlbaranWrap');
+  const input = document.getElementById('psAlbaran');
+  input.value = s.num_albaran || '';
+
+  const detectado = !!(s.albaran_url && s.num_albaran);
+  input.disabled = detectado || !s.albaran_url;
+  wrap.classList.toggle('detectado', detectado);
+  input.placeholder = s.albaran_url ? 'No detectado · escríbelo a mano' : 'Se rellena al subir el albarán';
+  psSincronizarBaseCampo('num_albaran');
+  actualizarBotonGuardarPanel();
+}
+
+// Igual que con el Nº Albarán: el campo Valor empieza BLOQUEADO hasta que
+// se sube la factura (y se detecta el importe); el lápiz de "editar
+// manualmente" solo aparece una vez hay algo detectado que corregir.
+function aplicarEstadoCampoValor(s) {
+  const wrap = document.getElementById('psValorWrap');
+  const input = document.getElementById('psValor');
+  const tieneValor = s.valor !== null && s.valor !== undefined && s.valor !== '';
+  input.value = tieneValor ? s.valor : '';
+
+  const detectado = !!(s.factura_url && tieneValor);
+  input.disabled = detectado || !s.factura_url;
+  wrap.classList.toggle('detectado', detectado);
+  input.placeholder = s.factura_url ? 'No detectado · escríbelo a mano' : 'Se rellena al subir la factura';
+  psSincronizarBaseCampo('valor');
+  actualizarBotonGuardarPanel();
+}
+
+// Igual que el Nº Albarán: el campo Nº Factura empieza BLOQUEADO hasta que
+// se sube la factura y se detecta el número; el lápiz de "editar
+// manualmente" solo aparece una vez hay algo detectado que corregir.
+function aplicarEstadoCampoFactura(s) {
+  const wrap = document.getElementById('psFacturaNumWrap');
+  const input = document.getElementById('psFacturaNum');
+  input.value = s.num_factura || '';
+
+  const detectado = !!(s.factura_url && s.num_factura);
+  input.disabled = detectado || !s.factura_url;
+  wrap.classList.toggle('detectado', detectado);
+  input.placeholder = s.factura_url ? 'No detectado · escríbelo a mano' : 'Se rellena al subir la factura';
+  psSincronizarBaseCampo('num_factura');
+  actualizarBotonGuardarPanel();
+}
+
+// Los tres botones-lápiz son fijos en el HTML (ya no se recrean cada vez
+// que se pinta el campo), así que sus listeners se enganchan una sola vez.
+document.getElementById('btnEditarNumAlbaran')?.addEventListener('click', () => {
+  document.getElementById('psAlbaran').disabled = false;
+  document.getElementById('psAlbaran').focus();
+  document.getElementById('psAlbaranWrap').classList.remove('detectado');
+});
+document.getElementById('btnEditarValor')?.addEventListener('click', () => {
+  document.getElementById('psValor').disabled = false;
+  document.getElementById('psValor').focus();
+  document.getElementById('psValorWrap').classList.remove('detectado');
+});
+document.getElementById('btnEditarNumFactura')?.addEventListener('click', () => {
+  document.getElementById('psFacturaNum').disabled = false;
+  document.getElementById('psFacturaNum').focus();
+  document.getElementById('psFacturaNumWrap').classList.remove('detectado');
+});
+
+function pintarAlbaranModal(s) {
+  const cont = document.getElementById('psAlbaranZona');
+  if (!s.albaran_url) {
+    cont.innerHTML = `
+      <p class="ps-sin-archivos">Todavía no se ha adjuntado el albarán.</p>
+      <button type="button" class="btn" id="btnAdjuntarAlbaran" style="cursor:pointer;">📎 Adjuntar albarán</button>`;
+    document.getElementById('btnAdjuntarAlbaran').addEventListener('click', () => document.getElementById('psAlbaranInput').click());
+    return;
+  }
+  // El estado "Enviado a Facturación" (quién y cuándo) ya se ve en el paso
+  // "Albarán enviado a facturación" del seguimiento, así que aquí solo
+  // quedan los iconos de acción, en línea con el nombre del archivo.
+  const tituloReenvio = s.enviado_facturacion ? 'Reenviar a Facturación' : 'Enviar a Facturación';
+  cont.innerHTML = `
+    <div class="archivo-fila-pdf">
+      <button type="button" class="ps-factura-chip" id="btnVerAlbaran">📄 ${escapeHtml(s.albaran_nombre || 'Ver albarán')}</button>
+      <div class="archivo-iconos">
+        <button type="button" class="icono-accion" id="btnEnviarFacturacion" title="${tituloReenvio}">↻</button>
+        <button type="button" class="icono-accion" id="btnQuitarAlbaran" title="Quitar albarán">🗑️</button>
+      </div>
+    </div>`;
+  document.getElementById('btnVerAlbaran').addEventListener('click', () =>
+    abrirVisorPdfPanel(s.albaran_url, { titulo: '📄 Albarán', nombreArchivo: s.albaran_nombre || 'albaran.pdf' }));
+  document.getElementById('btnQuitarAlbaran').addEventListener('click', quitarAlbaranPanel);
+  document.getElementById('btnEnviarFacturacion').addEventListener('click', () => ofrecerEnvioFacturacion(s));
+}
+
+document.getElementById('psAlbaranInput')?.addEventListener('change', async (e) => {
+  const file = e.target.files?.[0];
+  if (!file || !panelActivoId) return;
+  const errEl = document.getElementById('psAlbaranError');
+  errEl.style.display = 'none';
+  try {
+    document.getElementById('cargandoEnvioTexto').textContent = 'Subiendo albarán…';
+    document.getElementById('cargandoEnvioOverlay').classList.add('show');
+
+    const path = `panel/${panelActivoId}/albaran-${Date.now()}-${nombreSeguroParaStorage(file.name)}`;
+    const { error: eUp } = await sb.storage.from(BUCKET_FACTURAS_PANEL).upload(path, file);
+    if (eUp) throw eUp;
+    const { data: pub } = sb.storage.from(BUCKET_FACTURAS_PANEL).getPublicUrl(path);
+
+    // Intentamos leer el nº de albarán del propio PDF ("Num.Entrada")
+    const numeroDetectado = await extraerNumAlbaranDePdf(file);
+
+    // Quién y cuándo adjunta el albarán (se ve en el seguimiento). Un albarán
+    // nuevo vuelve a abrir la decisión de enviarlo o no a Facturación, así
+    // que se limpia un "omitido" anterior.
+    const usuarioActual = sesionActual?.nombre || sesionActual?.usuario || null;
+    const albaranAdjuntadoEn = new Date().toISOString();
+    const cambios = {
+      albaran_url: pub.publicUrl, albaran_nombre: file.name, actualizado_por: usuarioActual,
+      albaran_adjuntado_en: albaranAdjuntadoEn, albaran_adjuntado_por: usuarioActual,
+      facturacion_omitida_en: null, facturacion_omitida_por: null
+    };
+    if (numeroDetectado) cambios.num_albaran = numeroDetectado;
+
+    const { error: eDb } = await sb.from('panel_siniestros').update(cambios).eq('id', panelActivoId);
+    if (eDb) throw eDb;
+
+    const s = psSiniestroPorId(panelActivoId);
+    s.albaran_url = pub.publicUrl;
+    s.albaran_nombre = file.name;
+    s.albaran_adjuntado_en = albaranAdjuntadoEn;
+    s.albaran_adjuntado_por = usuarioActual;
+    s.facturacion_omitida_en = null;
+    s.facturacion_omitida_por = null;
+    if (numeroDetectado) s.num_albaran = numeroDetectado;
+    pintarAlbaranModal(s);
+    renderSeguimientoPanel(s);
+    aplicarEstadoCampoAlbaran(s);
+    renderPanelSiniestros();
+    document.getElementById('cargandoEnvioOverlay').classList.remove('show');
+    // Recién adjuntado: preguntamos directamente si se envía a Facturación
+    // (ya no hay botón "Guardar" que sirva de punto de corte para preguntar).
+    await ofrecerEnvioFacturacion(s, { trasAdjuntar: true });
+  } catch (err) {
+    console.error('Error subiendo el albarán:', err);
+    errEl.textContent = 'No se pudo subir el albarán.';
+    errEl.style.display = 'block';
+  } finally {
+    document.getElementById('cargandoEnvioOverlay').classList.remove('show');
+    e.target.value = '';
+  }
+});
+
+async function quitarAlbaranPanel() {
+  const ok = await modalConfirm('¿Quitar el albarán adjunto? También se vaciará el Nº Albarán detectado.', { titulo: 'Quitar albarán', danger: true, textoOk: 'Quitar' });
+  if (!ok) return;
+  const s = psSiniestroPorId(panelActivoId);
+  const urlAEliminar = s?.albaran_url;
+  try {
+    // Al quitar el albarán también se deshace el paso "Albarán enviado a
+    // facturación" del seguimiento (enviado u omitido): sin albarán ese paso
+    // vuelve a quedar pendiente, y al subir uno nuevo se volverá a pedir.
+    const { error } = await sb.from('panel_siniestros').update({ albaran_url: null, albaran_nombre: null, num_albaran: null, albaran_adjuntado_en: null, albaran_adjuntado_por: null, facturacion_omitida_en: null, facturacion_omitida_por: null, enviado_facturacion: false, facturacion_enviado_en: null, facturacion_enviado_por: null, actualizado_por: sesionActual?.nombre || sesionActual?.usuario || null }).eq('id', panelActivoId);
+    if (error) throw error;
+    if (s) {
+      s.albaran_url = null; s.albaran_nombre = null; s.num_albaran = null;
+      s.albaran_adjuntado_en = null; s.albaran_adjuntado_por = null;
+      s.facturacion_omitida_en = null; s.facturacion_omitida_por = null;
+      s.enviado_facturacion = false; s.facturacion_enviado_en = null; s.facturacion_enviado_por = null;
+    }
+    pintarAlbaranModal(s);
+    renderSeguimientoPanel(s);
+    aplicarEstadoCampoAlbaran(s); // vacía y libera el campo Nº Albarán para poder editarlo a mano
+    renderPanelSiniestros();
+    await borrarDeStoragePorUrl(BUCKET_FACTURAS_PANEL, urlAEliminar);
+    if (typeof registrarAccion === 'function') {
+      registrarAccion('siniestros', 'Quitar albarán de siniestro', psDetalleAuditoria(s));
+    }
+  } catch (err) {
+    console.error('Error quitando el albarán:', err);
+  }
+}
+
+// ---------------- Justificante de recogida ----------------
+// Solo tiene sentido cuando "Estado de la recogida" = RECOGIDO POR AGENCIA
+// (la propia agencia ha venido a recoger la mercancía rota, y traen o
+// firman un justificante de la recogida).
+
+function pintarJustificanteModal(s) {
+  const cont = document.getElementById('psJustificanteZona');
+  if (!cont) return;
+  if (s.justificante_recogida_url) {
+    cont.innerHTML = `
+      <button type="button" class="ps-factura-chip" id="btnVerJustificante">📄 ${escapeHtml(s.justificante_recogida_nombre || 'Ver justificante')}</button>
+      <button type="button" class="mini-btn" id="btnQuitarJustificante" title="Quitar justificante">✕</button>`;
+    document.getElementById('btnVerJustificante').addEventListener('click', () =>
+      abrirVisorPdfPanel(s.justificante_recogida_url, { titulo: '📄 Justificante de recogida', nombreArchivo: s.justificante_recogida_nombre || 'justificante.pdf' }));
+    document.getElementById('btnQuitarJustificante').addEventListener('click', quitarJustificantePanel);
+  } else {
+    cont.innerHTML = `
+      <p class="ps-sin-archivos">Todavía no se ha adjuntado el justificante.</p>
+      <button type="button" class="btn" id="btnAdjuntarJustificante" style="cursor:pointer;">📎 Adjuntar justificante</button>`;
+    document.getElementById('btnAdjuntarJustificante').addEventListener('click', () => document.getElementById('psJustificanteInput').click());
+  }
+}
+
+document.getElementById('psJustificanteInput')?.addEventListener('change', async (e) => {
+  const file = e.target.files?.[0];
+  if (!file || !panelActivoId) return;
+  const errEl = document.getElementById('psJustificanteError');
+  errEl.style.display = 'none';
+  try {
+    document.getElementById('cargandoEnvioTexto').textContent = 'Subiendo justificante…';
+    document.getElementById('cargandoEnvioOverlay').classList.add('show');
+
+    const comprimido = await comprimirImagenParaSubida(file);
+    const path = `panel/${panelActivoId}/justificante-${Date.now()}-${nombreSeguroParaStorage(comprimido.name)}`;
+    const { error: eUp } = await sb.storage.from(BUCKET_FACTURAS_PANEL).upload(path, comprimido);
+    if (eUp) throw eUp;
+    const { data: pub } = sb.storage.from(BUCKET_FACTURAS_PANEL).getPublicUrl(path);
+    const { error: eDb } = await sb.from('panel_siniestros')
+      .update({ justificante_recogida_url: pub.publicUrl, justificante_recogida_nombre: comprimido.name, actualizado_por: sesionActual?.nombre || sesionActual?.usuario || null })
+      .eq('id', panelActivoId);
+    if (eDb) throw eDb;
+    const s = psSiniestroPorId(panelActivoId);
+    s.justificante_recogida_url = pub.publicUrl;
+    s.justificante_recogida_nombre = comprimido.name;
+    pintarJustificanteModal(s);
+  } catch (err) {
+    console.error('Error subiendo el justificante:', err);
+    errEl.textContent = 'No se pudo subir el justificante.';
+    errEl.style.display = 'block';
+  } finally {
+    document.getElementById('cargandoEnvioOverlay').classList.remove('show');
+    e.target.value = '';
+  }
+});
+
+async function quitarJustificantePanel() {
+  const ok = await modalConfirm('¿Quitar el justificante de recogida?', { titulo: 'Quitar justificante', danger: true, textoOk: 'Quitar' });
+  if (!ok) return;
+  const s = psSiniestroPorId(panelActivoId);
+  const urlAEliminar = s?.justificante_recogida_url;
+  try {
+    const { error } = await sb.from('panel_siniestros').update({ justificante_recogida_url: null, justificante_recogida_nombre: null, actualizado_por: sesionActual?.nombre || sesionActual?.usuario || null }).eq('id', panelActivoId);
+    if (error) throw error;
+    if (s) { s.justificante_recogida_url = null; s.justificante_recogida_nombre = null; }
+    pintarJustificanteModal(s);
+    await borrarDeStoragePorUrl(BUCKET_FACTURAS_PANEL, urlAEliminar);
+    if (typeof registrarAccion === 'function') {
+      registrarAccion('siniestros', 'Quitar justificante de recogida', psDetalleAuditoria(s));
+    }
+  } catch (err) {
+    console.error('Error quitando el justificante:', err);
+  }
+}
+
+// ---------------- Envío del albarán a Facturación ----------------
+// La plantilla del correo (asunto + cuerpo) vive en email-plantillas.js:
+// plantillaFacturacionAlbaran(s, nombreComercialAgencia).
+
+async function ofrecerEnvioFacturacion(s, { trasAdjuntar = false } = {}) {
+  // Justo después de adjuntar un albarán que aún no se ha enviado, decir que
+  // no deja registrado el envío como omitido (quién y cuándo), para que el
+  // seguimiento lo muestre igual que "Envío a agencia omitido".
+  const registrarOmitido = trasAdjuntar && !s.enviado_facturacion;
+  const ok = await modalConfirm(
+    s.enviado_facturacion
+      ? '¿Reenviar este albarán a Facturación por correo?'
+      : '¿Quieres enviar este albarán a Facturación por correo?',
+    { titulo: 'Enviar a Facturación', textoOk: 'Enviar', textoCancel: registrarOmitido ? 'Omitir envío' : 'Cancelar' }
+  );
+  if (!ok) {
+    if (registrarOmitido) await registrarFacturacionOmitida(s);
+    return;
+  }
+
+  try {
+    const { data: dest, error: eDest } = await sb.from('facturacion_emails').select('email').eq('activo', true);
+    if (eDest) throw eDest;
+    const destinatarios = (dest || []).map(d => d.email);
+    if (!destinatarios.length) {
+      await modalAlert('No hay destinatarios de Facturación configurados. Añádelos en Gestión → Agencias.', { titulo: 'Sin destinatarios' });
+      return;
+    }
+
+    let nombreComercial = null;
+    if (s.agencia_id) {
+      const { data: ag } = await sb.from('agencias').select('nombre_comercial').eq('id', s.agencia_id).maybeSingle();
+      nombreComercial = ag?.nombre_comercial || null;
+    }
+
+    const { subject, html, text } = s.origen === 'AGENCIA'
+      ? plantillaFacturacionAlbaranAgencia(s, nombreComercial)
+      : plantillaFacturacionAlbaran(s, nombreComercial);
+    const adjuntos = [...(s.fotos || []), s.albaran_url].filter(Boolean);
+
+    await enviarEmail({ to: destinatarios, subject, html, text, attachmentUrls: adjuntos });
+
+    const facturacionEnviadoEn = new Date().toISOString();
+    const facturacionEnviadoPor = sesionActual?.nombre || sesionActual?.usuario || null;
+    const { error: eUpd } = await sb.from('panel_siniestros').update({
+      enviado_facturacion: true,
+      facturacion_enviado_en: facturacionEnviadoEn,
+      facturacion_enviado_por: facturacionEnviadoPor,
+      facturacion_omitida_en: null,
+      facturacion_omitida_por: null
+    }).eq('id', s.id);
+    if (eUpd) throw eUpd;
+
+    s.enviado_facturacion = true;
+    s.facturacion_enviado_en = facturacionEnviadoEn;
+    s.facturacion_enviado_por = facturacionEnviadoPor;
+    s.facturacion_omitida_en = null;
+    s.facturacion_omitida_por = null;
+    pintarAlbaranModal(s);
+    renderSeguimientoPanel(s);
+    renderPanelSiniestros();
+  } catch (err) {
+    console.error('Error enviando el albarán a Facturación:', err);
+    await modalAlert(`No se pudo enviar el correo a Facturación: ${err.message}`, { titulo: 'Error de envío' });
+  }
+}
+
+// Deja constancia de que se decidió no enviar el albarán a Facturación.
+async function registrarFacturacionOmitida(s) {
+  const omitidaEn = new Date().toISOString();
+  const omitidaPor = sesionActual?.nombre || sesionActual?.usuario || null;
+  try {
+    const { error } = await sb.from('panel_siniestros').update({
+      facturacion_omitida_en: omitidaEn,
+      facturacion_omitida_por: omitidaPor
+    }).eq('id', s.id);
+    if (error) throw error;
+    s.facturacion_omitida_en = omitidaEn;
+    s.facturacion_omitida_por = omitidaPor;
+    renderSeguimientoPanel(s);
+    renderPanelSiniestros();
+  } catch (err) {
+    console.error('No se pudo registrar el envío a Facturación omitido:', err);
+  }
+}
+
+// ---------------- Enganche de eventos generales ----------------
+
+document.getElementById('btnCerrarPsModal')?.addEventListener('click', cerrarModalPanelSiniestro);
+// El modal ya no se cierra al hacer clic fuera (solo con la X o Eliminar),
+// para evitar cerrarlo sin querer con cambios a medio escribir.
+document.getElementById('btnBorrarPanelSiniestro')?.addEventListener('click', eliminarPanelSiniestro);
+
+// Cada vez que se entra en la pestaña se recarga desde la base de datos,
+// para que el Panel siempre muestre los datos más recientes (por ejemplo,
+// un siniestro recién enviado desde "Siniestros del día").
+document.querySelectorAll('[data-view="panel-siniestros"]').forEach(el => {
+  el.addEventListener('click', async () => {
+    if (!agenciasCache.length) await cargarAgenciasYTiendas();
+    await cargarPanelSiniestros();
+  });
+});

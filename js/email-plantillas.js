@@ -1,0 +1,1166 @@
+  // Plantillas de correo
+  // ---------------------------------------------------------------
+  // Plantillas reales de "Aviso de roturas" y "Aviso de faltas".
+  // Ampliable en el futuro con más funciones (informe diario, resúmenes...).
+
+  // Formatea una fecha ISO (YYYY-MM-DD) al formato es-ES (DD/MM/AAAA)
+  function fechaEs(fechaISO) {
+    if (!fechaISO) return '—';
+    return formatearFechaCorta(new Date(fechaISO + 'T00:00:00'));
+  }
+
+  function plantillaHtmlRotura(tienda, fechaInformeStr, fechaLimite) {
+    return `
+<div style="font-family: Arial, sans-serif; background-color: #f4f7fa; padding: 20px;">
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#f4f7fa">
+    <tr>
+      <td align="center">
+        <table width="600" cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" style="border: 1px solid #edf2f7; border-radius: 24px;">
+          <tr>
+            <td align="center" style="padding: 32px 40px; border-bottom: 1px solid #f1f5f9;">
+              <h2 style="margin: 0; color: #1e293b; font-family: Arial, sans-serif; font-size: 18px; font-weight: 800; letter-spacing: 1px; text-transform: uppercase;">
+                AVISO DE ROTURAS<br> EN LA ENTREGA DE MERCANCIA
+              </h2>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr><td height="20" style="font-size: 1px; line-height: 1px;">&nbsp;</td></tr>
+              </table>
+              <table cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td style="padding: 4px;">
+                    <table cellpadding="0" cellspacing="0" border="0" bgcolor="#fef2f2" style="background-color: #fef2f2; border: 1px solid #fee2e2; border-radius: 20px;">
+                      <tr>
+                        <td style="padding: 6px 16px; font-family: Arial, sans-serif; font-size: 13px; font-weight: 700; color: #ef4444; text-transform: uppercase; white-space: nowrap;">
+                          Tienda: ${tienda.toUpperCase()}
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                  <td style="padding: 4px;">
+                    <table cellpadding="0" cellspacing="0" border="0" bgcolor="#f1f5f9" style="background-color: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 20px;">
+                      <tr>
+                        <td style="padding: 6px 16px; font-family: Arial, sans-serif; font-size: 13px; font-weight: 700; color: #475569; text-transform: uppercase; white-space: nowrap;">
+                          Recepción: ${fechaInformeStr}
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 40px; background-color: #ffffff;">
+              <p style="margin: 0; color: #475569; font-size: 15px; line-height: 1.6;">Buenas,</p>
+              <p style="margin-top: 16px; color: #475569; font-size: 15px; line-height: 1.6;">
+                Se han detectado varias incidencias en la mercancía recibida en nuestra tienda de <b style="color: #000000;">${tienda.toUpperCase()}</b> (ver fecha de recepción arriba), presentando algunos bultos rotos y golpeados.
+              </p>
+              <p style="margin-top: 16px; color: #475569; font-size: 15px; line-height: 1.6;">
+                Tras haber revisado la mercancia en nuestra tienda, os podemos confirmar que se han producido algunas <b style="color: #000000;">ROTURAS</b>.<br><br> 
+                Mis compañeros en los próximos días os pasará el cargo correspondiente.
+              </p>
+              <p style="margin-top: 16px; color: #1e293b; font-size: 15px; line-height: 1.6; font-weight: 600;">
+                Es vital que tengáis especial cuidado con nuestra mercancía puesto que es muy frágil y costosa. <br><br>El hecho de que se produzcan estas incidencias nos afecta en las ventas y en el normal funcionamiento de la tienda.
+              </p>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0" role="presentation">
+                <tr>
+                  <td align="center" style="padding: 20px 0;">
+                    <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color: #fffbeb; border: 1px solid #fef3c7; border-radius: 20px;">
+                      <tr>
+                        <td align="center" style="padding: 30px 20px;">
+                          <table cellpadding="0" cellspacing="0" border="0">
+                            <tr>
+                              <td align="center" style="padding-bottom: 15px; color: #b45309; font-family: Arial, sans-serif; font-size: 13px; font-weight: bold; text-transform: uppercase; letter-spacing: 1px;">
+                                ⚠️ ACCIÓN REQUERIDA (SEGURO/RECOGIDA)
+                              </td>
+                            </tr>
+                          </table>
+                          <table cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" style="border: 1px solid #fde68a; border-radius: 12px; width: 280px;">
+                            <tr>
+                              <td align="center" style="padding: 20px;">
+                                <div style="font-family: Arial, sans-serif; font-size: 11px; color: #b45309; font-weight: bold; text-transform: uppercase;">
+                                  FECHA LÍMITE DE RECOGIDA:
+                                </div>
+                                <div style="font-family: Arial, sans-serif; font-size: 28px; font-weight: 800; color: #d97706; margin-top: 5px;">
+                                  ${fechaLimite}
+                                </div>
+                              </td>
+                            </tr>
+                          </table>
+                          <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                            <tr><td height="35" style="font-size: 1px; line-height: 1px;">&nbsp;</td></tr>
+                          </table>
+                          <table width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width: 480px;">
+                            <tr>
+                              <td align="center" style="font-family: Arial, sans-serif; font-size: 12px; color: #92400e; font-style: italic; line-height: 18px;">
+                                * En caso de necesitar la mercancía averiada para el seguro se deberá recoger en nuestra tienda en los próximos 15 días.
+                              </td>
+                            </tr>
+                            <tr><td height="15" style="font-size: 1px; line-height: 1px;">&nbsp;</td></tr>
+                            <tr>
+                              <td align="center" style="font-family: Arial, sans-serif; font-size: 12px; color: #92400e; font-style: italic; line-height: 18px;">
+                                Transcurrido la fecha limite más arriba indicada, procederemos a su destrucción y no podrá reclamarnos dicha mercancía.
+                              </td>
+                            </tr>
+                          </table>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top: 10px; border-top: 0px solid #f1f5f9; padding-top: 0px;">
+              <tr>
+              <td align="center"> <p style="color: #475569; font-size: 15px; line-height: 1.6; margin: 0; text-align: center;"> Atentamente,<br>
+              <b style="color: #1e293b;">Departamento de Transporte</b>
+              </p>
+             <p style="margin-top: 16px; margin-bottom: 0; text-align: center;">
+             <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/5/5b/Primor_Logo.png/960px-Primor_Logo.png" 
+             alt="PRIMOR" 
+             width="150" 
+             style="display: inline-block; border:0; margin: 0 auto;"> </p>
+            </td>
+            </tr>
+          </table>
+          <tr>
+            <td align="center" bgcolor="#f8fafc" style="padding: 20px; border-top: 1px solid #f1f5f9;">
+              <span style="font-family: Arial, sans-serif; font-size: 9px; color: #cbd5e1; font-weight: 400; text-transform: uppercase; letter-spacing: 2px;">
+              CORREO GENERADO AUTOMATICAMENTE POR EL SISTEMA GIDT
+              </span>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</div>`;
+  }
+
+  function plantillaHtmlFalta(tienda, fechaInformeStr) {
+    return `
+<div style="font-family: Arial, sans-serif; background-color: #f4f7fa; padding: 20px;">
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#f4f7fa">
+    <tr>
+      <td align="center">
+        <table width="600" cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" style="border: 1px solid #edf2f7; border-radius: 24px;">
+          <tr>
+            <td align="center" style="padding: 32px 40px; border-bottom: 1px solid #f1f5f9;">
+              <h2 style="margin: 0; color: #1e293b; font-family: Arial, sans-serif; font-size: 18px; font-weight: 800; letter-spacing: 1px; text-transform: uppercase;">
+              AVISO DE <span style="color: #ff0000;">FALTAS</span><br> EN LA ENTREGA DE MERCANCIA
+              </h2>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr><td height="20" style="font-size: 1px; line-height: 1px;">&nbsp;</td></tr>
+              </table>
+              <table cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td style="padding: 4px;">
+                    <table cellpadding="0" cellspacing="0" border="0" bgcolor="#fef2f2" style="background-color: #fef2f2; border: 1px solid #fee2e2; border-radius: 50px;">
+                      <tr>
+                        <td style="padding: 6px 16px; font-family: Arial, sans-serif; font-size: 13px; font-weight: 700; color: #ef4444; text-transform: uppercase; white-space: nowrap;">
+                          Tienda: ${tienda.toUpperCase()}
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                  <td style="padding: 4px;">
+                    <table cellpadding="0" cellspacing="0" border="0" bgcolor="#f1f5f9" style="background-color: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 50px;">
+                      <tr>
+                        <td style="padding: 6px 16px; font-family: Arial, sans-serif; font-size: 13px; font-weight: 700; color: #475569; text-transform: uppercase; white-space: nowrap;">
+                          Recepción: ${fechaInformeStr}
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 40px; background-color: #ffffff;">
+              <p style="margin: 0; color: #475569; font-size: 15px; line-height: 1.6;">Buenas,</p>
+              <p style="margin-top: 16px; color: #475569; font-size: 15px; line-height: 1.6;">
+                Se han detectado varias incidencias en la mercancía recibida en nuestra tienda de <b style="color: #000000;">${tienda.toUpperCase()}</b> (ver fecha de recepción arriba), con bultos/mercancia faltantes.
+              </p>
+              <p style="margin-top: 16px; color: #475569; font-size: 15px; line-height: 1.6;">
+                Tras haber revisado la mercancia en nuestra tienda, os podemos confirmar que se han producido algunas <b style="color: #ef4444;">FALTAS</b>.<br><br> 
+                Mis compañeros en los próximos días os pasará el cargo correspondiente.
+              </p>
+              <p style="margin-top: 16px; color: #1e293b; font-size: 15px; line-height: 1.6; font-weight: 600;">
+                Es vital que tengáis especial cuidado con nuestra mercancía puesto que es muy frágil y costosa. <br><br>El hecho de que se produzcan estas incidencias nos afecta en las ventas y en el normal funcionamiento de la tienda.
+              </p>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top: 40px;">
+              <tr>
+              <td align="center" style="text-align: center;">
+              <p style="color: #475569; font-size: 15px; line-height: 1.6; margin: 0;">
+              Atentamente,<br>
+             <b style="color: #1e293b;">Departamento de Transporte</b>
+             </p>
+             <p style="margin-top: 15px; margin-bottom: 0;">
+            <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/5/5b/Primor_Logo.png/960px-Primor_Logo.png" 
+             alt="PRIMOR" 
+             width="150" 
+             style="display: inline-block; border:0;">
+            </p>
+           </td>
+           </tr>
+         </table>
+            </td>
+          </tr>
+          <tr>
+            <td align="center" bgcolor="#f8fafc" style="padding: 20px; border-top: 1px solid #f1f5f9; border-radius: 0 0 24px 24px;">
+              <span style="font-family: Arial, sans-serif; font-size: 9px; color: #cbd5e1; font-weight: 400; text-transform: uppercase; letter-spacing: 2px;">
+              CORREO GENERADO AUTOMATICAMENTE POR EL SISTEMA GIDT
+              </span>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</div>`;
+  }
+
+  function plantillaHtmlMixto(tienda, fechaInformeStr, fechaLimite) {
+    return `
+<div style="font-family: Arial, Helvetica, sans-serif; background-color: #f4f7fa; padding: 20px;">
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#f4f7fa">
+    <tr>
+      <td align="center">
+        <table width="600" cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" style="border: 1px solid #edf2f7; border-radius: 24px;">
+          <tr>
+            <td align="center" style="padding: 32px 40px; border-bottom: 1px solid #f1f5f9;">
+              <h2 style="margin: 0; color: #1e293b; font-family: Arial, sans-serif; font-size: 18px; font-weight: 800; letter-spacing: 1px; text-transform: uppercase;">
+              AVISO DE ROTURAS Y <span style="color: #ff0000;">FALTAS</span><br> EN LA ENTREGA DE MERCANCIA
+              </h2>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr><td height="20" style="font-size: 1px; line-height: 1px;">&nbsp;</td></tr>
+              </table>
+              <table cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td style="padding: 4px;">
+                    <table cellpadding="0" cellspacing="0" border="0" bgcolor="#fef2f2" style="background-color: #fef2f2; border: 1px solid #fee2e2; border-radius: 50px;">
+                      <tr><td style="padding: 6px 16px; font-family: Arial, sans-serif; font-size: 13px; font-weight: 700; color: #ef4444; text-transform: uppercase;">Tienda: ${tienda.toUpperCase()}</td></tr>
+                    </table>
+                  </td>
+                  <td style="padding: 4px;">
+                    <table cellpadding="0" cellspacing="0" border="0" bgcolor="#f1f5f9" style="background-color: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 50px;">
+                      <tr><td style="padding: 6px 16px; font-family: Arial, sans-serif; font-size: 13px; font-weight: 700; color: #475569; text-transform: uppercase;">Recepción: ${fechaInformeStr}</td></tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 40px 40px 10px 40px; background-color: #ffffff;">
+              <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td style="font-family: Arial, sans-serif; font-size: 15px; color: #475569; line-height: 1.6;">
+                    Buenas,<br><br>
+                    Se han detectado varias incidencias en la mercancía recibida en nuestra tienda de <b style="color: #000000;">${tienda.toUpperCase()}</b> (ver fecha de recepción arriba), presentando bultos faltantes y bultos rotos y golpeados.<br><br>
+                    Tras haber revisado la mercancia en nuestra tienda, os podemos confirmar que se han producido algunas <b style="color: #000000;">ROTURAS</b> y <b style="color: #ef4444;">FALTAS</b>.<br><br>
+                    Mis compañeros en los próximos días os pasará el cargo correspondiente.<br><br>
+                    <strong>Es vital que tengáis especial cuidado con nuestra mercancía puesto que es muy frágil y costosa.</strong><br><br>
+                    <strong>El hecho de que se produzcan estas incidencias nos afecta en las ventas y en el normal funcionamiento de la tienda.</strong>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr><td height="30" style="font-size: 1px; line-height: 1px;">&nbsp;</td></tr>
+          <tr>
+            <td style="padding: 0 40px;">
+              <table width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#fffbeb" style="background-color: #fffbeb; border: 1px solid #fef3c7; border-radius: 20px;">
+                <tr>
+                  <td align="center" style="padding: 24px 24px 30px 24px;">
+                    <div style="margin-bottom: 15px; color: #b45309; font-family: Arial, sans-serif; font-size: 12px; font-weight: 800; text-transform: uppercase;">
+                      ⚠️ ACCIÓN REQUERIDA (SEGURO/RECOGIDA)
+                    </div>
+                    <table cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" style="background-color: #ffffff; border: 1px solid #fde68a; border-radius: 12px;">
+                      <tr>
+                        <td align="center" style="padding: 16px 30px;">
+                          <div style="font-family: Arial, sans-serif; font-size: 11px; color: #b45309; font-weight: 700;">FECHA LÍMITE DE RECOGIDA:</div>
+                          <div style="font-family: Arial, sans-serif; font-size: 26px; font-weight: 800; color: #d97706;">${fechaLimite}</div>
+                        </td>
+                      </tr>
+                    </table>
+                    <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                      <tr><td height="40" style="font-size: 1px; line-height: 1px;">&nbsp;</td></tr>
+                    </table>
+                    <div style="font-family: Arial, sans-serif; font-size: 12px; color: #92400e; font-style: italic; line-height: 1.5;">
+                      * En caso de necesitar la mercancía averiada para el seguro se deberá recoger en nuestra tienda en los próximos 15 días.<br><br>
+                      Transcurrido la fecha limite más arriba indicada, procederemos a su destrucción y no podrá reclamarnos dicha mercancía.
+                    </div>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr><td height="30" style="font-size: 1px; line-height: 1px;">&nbsp;</td></tr>
+          <tr>
+            <td style="padding: 0 40px 40px 40px;">
+              <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top: 10px;">
+              <tr>
+              <td align="center" style="text-align: center;">
+              <p style="color: #475569; font-size: 15px; line-height: 1.6; margin: 0;">
+              Atentamente,<br>
+             <b style="color: #1e293b;">Departamento de Transporte</b>
+             </p>
+             <p style="margin-top: 15px; margin-bottom: 0;">
+            <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/5/5b/Primor_Logo.png/960px-Primor_Logo.png" 
+             alt="PRIMOR" 
+             width="150" 
+             style="display: inline-block; border:0;">
+            </p>
+           </td>
+           </tr>
+         </table>
+            </td>
+          </tr>
+          <tr>
+            <td align="center" bgcolor="#f8fafc" style="padding: 20px; border-top: 1px solid #f1f5f9; border-radius: 0 0 24px 24px;">
+              <span style="font-family: Arial, sans-serif; font-size: 9px; color: #cbd5e1; font-weight: 400; text-transform: uppercase; letter-spacing: 2px;">
+              CORREO GENERADO AUTOMATICAMENTE POR EL SISTEMA GIDT
+              </span>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</div>`;
+  }
+
+  // Correo de "Resumen mensual" a una agencia (Análisis → Reportes
+  // mensuales → Enviar a agencias), con el PDF adjunto (ver
+  // js/reportes-mensuales-envio.js). Mismo texto que se mandaba a mano:
+  // "Buenos días, adjuntamos resumen de las entregas en el pasado mes de
+  // X con las incidencias que hayan tenido lugar. Gracias, un saludo".
+  function plantillaHtmlResumenMensual(nombreMesConAnio) {
+    return `
+<div style="font-family: Arial, sans-serif; background-color: #f4f7fa; padding: 20px;">
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#f4f7fa">
+    <tr>
+      <td align="center">
+        <table width="600" cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" style="border: 1px solid #edf2f7; border-radius: 24px;">
+          <tr>
+            <td style="padding: 40px; background-color: #ffffff;">
+              <p style="margin: 0; color: #475569; font-size: 15px; line-height: 1.6;">Buenas,</p>
+              <p style="margin-top: 16px; color: #475569; font-size: 15px; line-height: 1.6;">
+                Adjuntamos resumen de las entregas de <b style="color: #000000;">${escapeHtml(nombreMesConAnio)}</b> con las incidencias que hayan tenido lugar.
+              </p>
+              <p style="margin-top: 16px; color: #475569; font-size: 15px; line-height: 1.6;">
+                Gracias, un saludo.
+              </p>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top: 30px;">
+                <tr>
+                  <td align="center" style="text-align: center;">
+                    <p style="margin-top: 15px; margin-bottom: 0;">
+                      <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/5/5b/Primor_Logo.png/960px-Primor_Logo.png"
+                       alt="PRIMOR"
+                       width="150"
+                       style="display: inline-block; border:0;">
+                    </p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td align="center" bgcolor="#f8fafc" style="padding: 20px; border-top: 1px solid #f1f5f9; border-radius: 0 0 24px 24px;">
+              <span style="font-family: Arial, sans-serif; font-size: 9px; color: #cbd5e1; font-weight: 400; text-transform: uppercase; letter-spacing: 2px;">
+              CORREO GENERADO AUTOMATICAMENTE POR EL SISTEMA GIDT
+              </span>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</div>`;
+  }
+
+  // ---------------------------------------------------------------
+  // Siniestros SIN TIENDA (p. ej. una agencia ocasional como MRW, con un
+  // envío que no va a ninguna tienda en concreto): las plantillas de
+  // arriba están redactadas para una tienda, así que aquí se adaptan:
+  // fuera la etiqueta "Tienda:", "en nuestra tienda de X" pasa a "en un
+  // envío de mercancía", y se añade lo escrito en Información como detalle.
+  function adaptarHtmlSinTienda(html, informacion) {
+    let h = html;
+    // Etiqueta "Tienda: —" de la cabecera (todas las variantes).
+    h = h.replace(/<td style="padding: 4px;">\s*<table[^>]*>\s*<tr>\s*<td[^>]*>\s*Tienda:[^<]*<\/td>\s*<\/tr>\s*<\/table>\s*<\/td>/g, '');
+    const detalle = informacion
+      ? `<br><br><b style="color: #000000;">Detalle:</b> ${escapeHtml(informacion)}`
+      : '';
+    h = h.replace(/la mercancía recibida en nuestra tienda de <b[^>]*>[^<]*<\/b> \(ver fecha de recepción arriba\)([^<]*)/g,
+      (m, resto) => `un envío de mercancía (ver fecha arriba)${resto}${detalle}`);
+    h = h.replace(/arreglar un palet de nuestra tienda <b[^>]*>[^<]*<\/b>,([^<]*)/g,
+      (m, resto) => `arreglar un palet nuestro,${resto}${detalle}`);
+    h = h.replace(/Tras haber revisado la mercancia en nuestra tienda,/g, 'Tras haber revisado la mercancía,');
+    h = h.replace(/se deberá recoger en nuestra tienda en los próximos 15 días/g, 'se deberá recoger en nuestras instalaciones en los próximos 15 días');
+    h = h.replace(/en el normal funcionamiento de la tienda\./g, 'en el normal funcionamiento de nuestro negocio.');
+    return h;
+  }
+
+  // Quita " – —" / " - —" (la tienda vacía) de un asunto.
+  function asuntoSinTienda(asunto) {
+    return asunto.replace(/ [–-] — [–-] /g, ' – ').replace(/ [–-] —$/, '');
+  }
+
+  // Genera { subject, html, text } para el siniestro dado (ROTURA, FALTA o MIXTO),
+  // usando la plantilla correspondiente.
+  function plantillaSiniestro(s, fechaInformeISO) {
+    const t = s.incidencia.tiendas || {};
+    const tienda = t.nombre || '—';
+    const fechaInformeStr = fechaEs(fechaInformeISO);
+    const fechaLimite = fechaEs(s.fecha_limite);
+
+    let html, subject, text;
+
+    if (s.tipo === 'ROTURA') {
+      html = plantillaHtmlRotura(tienda, fechaInformeStr, fechaLimite);
+      subject = `INCIDENCIA POR ROTURAS EN EL ENVIO – ${tienda.toUpperCase()} – ${fechaInformeStr}`;
+      text = `Se han detectado roturas en la mercancía recibida en la tienda ${tienda} (recepción ${fechaInformeStr}). Fecha límite de recogida para reclamación al seguro: ${fechaLimite}.`;
+    } else if (s.tipo === 'MIXTO') {
+      html = plantillaHtmlMixto(tienda, fechaInformeStr, fechaLimite);
+      subject = `FALTAS E INCIDENCIAS EN EL ENVIO – ${tienda.toUpperCase()} – ${fechaInformeStr}`;
+      text = `Se han detectado roturas y faltas en la mercancía recibida en la tienda ${tienda} (recepción ${fechaInformeStr}). Fecha límite de recogida para reclamación al seguro: ${fechaLimite}.`;
+    } else {
+      html = plantillaHtmlFalta(tienda, fechaInformeStr);
+      subject = `FALTAS EN EL ENVIO – ${tienda.toUpperCase()} – ${fechaInformeStr}`;
+      text = `Se han detectado faltas en la mercancía recibida en la tienda ${tienda} (recepción ${fechaInformeStr}).`;
+    }
+
+    if (!t.nombre) {
+      html = adaptarHtmlSinTienda(html, s.informacion);
+      subject = asuntoSinTienda(subject);
+      text = text.replace(/en la mercancía recibida en la tienda — \(recepción/, 'en un envío de mercancía (fecha')
+        + (s.informacion ? ` Detalle: ${s.informacion}` : '');
+    }
+
+    return { subject, html, text };
+  }
+
+  // ---------------------------------------------------------------
+  // Plantillas "en almacén de la agencia" (origen mercancía = AGENCIA):
+  // cuando la agencia llama para que un operario se desplace a SU
+  // almacén a arreglar un palet, y allí se detectan roturas y/o faltas.
+  // Mismo pie de página que las de arriba; el cuerpo cambia porque la
+  // reparación ocurre en las instalaciones de la agencia, no en tienda.
+  // ---------------------------------------------------------------
+
+  function plantillaHtmlRoturaAgencia(tienda, fechaInformeStr, fechaLimite) {
+    return `
+<div style="font-family: Arial, sans-serif; background-color: #f4f7fa; padding: 20px;">
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#f4f7fa">
+    <tr>
+      <td align="center">
+        <table width="600" cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" style="border: 1px solid #edf2f7; border-radius: 24px;">
+          <tr>
+            <td align="center" style="padding: 32px 40px; border-bottom: 1px solid #f1f5f9;">
+              <h2 style="margin: 0; color: #1e293b; font-family: Arial, sans-serif; font-size: 18px; font-weight: 800; letter-spacing: 1px; text-transform: uppercase;">
+                AVISO DE ROTURAS<br> EN NUESTRO PALET DE TIENDA
+              </h2>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr><td height="20" style="font-size: 1px; line-height: 1px;">&nbsp;</td></tr>
+              </table>
+              <table cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td style="padding: 4px;">
+                    <table cellpadding="0" cellspacing="0" border="0" bgcolor="#fef2f2" style="background-color: #fef2f2; border: 1px solid #fee2e2; border-radius: 20px;">
+                      <tr>
+                        <td style="padding: 6px 16px; font-family: Arial, sans-serif; font-size: 13px; font-weight: 700; color: #ef4444; text-transform: uppercase; white-space: nowrap;">
+                          Tienda: ${tienda.toUpperCase()}
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                  <td style="padding: 4px;">
+                    <table cellpadding="0" cellspacing="0" border="0" bgcolor="#f1f5f9" style="background-color: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 20px;">
+                      <tr>
+                        <td style="padding: 6px 16px; font-family: Arial, sans-serif; font-size: 13px; font-weight: 700; color: #475569; text-transform: uppercase; white-space: nowrap;">
+                          FECHA: ${fechaInformeStr}
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 40px; background-color: #ffffff;">
+              <p style="margin: 0; color: #475569; font-size: 15px; line-height: 1.6;">Buenas,</p>
+              <p style="margin-top: 16px; color: #475569; font-size: 15px; line-height: 1.6;">
+                Nuestros operarios se desplazaron a vuestras instalaciones para arreglar un palet de nuestra tienda <b style="color: #000000;">${tienda.toUpperCase()}</b>, presentando algunos bultos rotos y golpeados.
+              </p>
+              <p style="margin-top: 16px; color: #475569; font-size: 15px; line-height: 1.6;">
+                Tras haber revisado la mercancia en vuestras instalaciones, os podemos confirmar que se han producido algunas <b style="color: #000000;">ROTURAS</b>.<br><br> 
+                Mis compañeros en los próximos días os pasará el cargo correspondiente.
+              </p>
+              <p style="margin-top: 16px; color: #1e293b; font-size: 15px; line-height: 1.6; font-weight: 600;">
+                Es vital que tengáis especial cuidado con nuestra mercancía puesto que es muy frágil y costosa. <br><br>El hecho de que se produzcan estas incidencias nos afecta en las ventas y en el normal funcionamiento de la tienda.<br><br>La mercancia dañada la podreis recoger en nuestro almacen de Calle Escritora Carmen Martin Gaite Nº10, preguntando por Jose Luis Franco.
+              </p>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0" role="presentation">
+                <tr>
+                  <td align="center" style="padding: 20px 0;">
+                    <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color: #fffbeb; border: 1px solid #fef3c7; border-radius: 20px;">
+                      <tr>
+                        <td align="center" style="padding: 30px 20px;">
+                          <table cellpadding="0" cellspacing="0" border="0">
+                            <tr>
+                              <td align="center" style="padding-bottom: 15px; color: #b45309; font-family: Arial, sans-serif; font-size: 13px; font-weight: bold; text-transform: uppercase; letter-spacing: 1px;">
+                                ⚠️ ACCIÓN REQUERIDA (SEGURO/RECOGIDA)
+                              </td>
+                            </tr>
+                          </table>
+                          <table cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" style="border: 1px solid #fde68a; border-radius: 12px; width: 280px;">
+                            <tr>
+                              <td align="center" style="padding: 20px;">
+                                <div style="font-family: Arial, sans-serif; font-size: 11px; color: #b45309; font-weight: bold; text-transform: uppercase;">
+                                  FECHA LÍMITE DE RECOGIDA:
+                                </div>
+                                <div style="font-family: Arial, sans-serif; font-size: 28px; font-weight: 800; color: #d97706; margin-top: 5px;">
+                                  ${fechaLimite}
+                                </div>
+                              </td>
+                            </tr>
+                          </table>
+                          <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                            <tr><td height="35" style="font-size: 1px; line-height: 1px;">&nbsp;</td></tr>
+                          </table>
+                          <table width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width: 480px;">
+                            <tr>
+                              <td align="center" style="font-family: Arial, sans-serif; font-size: 12px; color: #92400e; font-style: italic; line-height: 18px;">
+                                * En caso de necesitar la mercancía averiada para el seguro se deberá recoger en nuestro almacen arriba indicado en los próximos 15 días.
+                              </td>
+                            </tr>
+                            <tr><td height="15" style="font-size: 1px; line-height: 1px;">&nbsp;</td></tr>
+                            <tr>
+                              <td align="center" style="font-family: Arial, sans-serif; font-size: 12px; color: #92400e; font-style: italic; line-height: 18px;">
+                                Transcurrido la fecha limite más arriba indicada, procederemos a su destrucción y no podrá reclamarnos dicha mercancía.
+                              </td>
+                            </tr>
+                          </table>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top: 10px; border-top: 0px solid #f1f5f9; padding-top: 0px;">
+              <tr>
+              <td align="center"> <p style="color: #475569; font-size: 15px; line-height: 1.6; margin: 0; text-align: center;"> Atentamente,<br>
+              <b style="color: #1e293b;">Departamento de Transporte</b>
+              </p>
+             <p style="margin-top: 16px; margin-bottom: 0; text-align: center;">
+             <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/5/5b/Primor_Logo.png/960px-Primor_Logo.png" 
+             alt="PRIMOR" 
+             width="150" 
+             style="display: inline-block; border:0; margin: 0 auto;"> </p>
+            </td>
+            </tr>
+          </table>
+          <tr>
+            <td align="center" bgcolor="#f8fafc" style="padding: 20px; border-top: 1px solid #f1f5f9;">
+              <span style="font-family: Arial, sans-serif; font-size: 9px; color: #cbd5e1; font-weight: 400; text-transform: uppercase; letter-spacing: 2px;">
+              CORREO GENERADO AUTOMATICAMENTE POR EL SISTEMA GIDT
+              </span>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</div>`;
+  }
+
+  // Igual que la de ROTURA en almacén de agencia, pero sin la frase de
+  // "la mercancía dañada la podréis recoger…" ni el aviso de fecha límite
+  // de recogida (una FALTA no tiene nada físico que recoger).
+  function plantillaHtmlFaltaAgencia(tienda, fechaInformeStr) {
+    return `
+<div style="font-family: Arial, sans-serif; background-color: #f4f7fa; padding: 20px;">
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#f4f7fa">
+    <tr>
+      <td align="center">
+        <table width="600" cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" style="border: 1px solid #edf2f7; border-radius: 24px;">
+          <tr>
+            <td align="center" style="padding: 32px 40px; border-bottom: 1px solid #f1f5f9;">
+              <h2 style="margin: 0; color: #1e293b; font-family: Arial, sans-serif; font-size: 18px; font-weight: 800; letter-spacing: 1px; text-transform: uppercase;">
+                AVISO DE <span style="color: #ff0000;">FALTAS</span><br> EN NUESTRO PALET DE TIENDA
+              </h2>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr><td height="20" style="font-size: 1px; line-height: 1px;">&nbsp;</td></tr>
+              </table>
+              <table cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td style="padding: 4px;">
+                    <table cellpadding="0" cellspacing="0" border="0" bgcolor="#fef2f2" style="background-color: #fef2f2; border: 1px solid #fee2e2; border-radius: 20px;">
+                      <tr>
+                        <td style="padding: 6px 16px; font-family: Arial, sans-serif; font-size: 13px; font-weight: 700; color: #ef4444; text-transform: uppercase; white-space: nowrap;">
+                          Tienda: ${tienda.toUpperCase()}
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                  <td style="padding: 4px;">
+                    <table cellpadding="0" cellspacing="0" border="0" bgcolor="#f1f5f9" style="background-color: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 20px;">
+                      <tr>
+                        <td style="padding: 6px 16px; font-family: Arial, sans-serif; font-size: 13px; font-weight: 700; color: #475569; text-transform: uppercase; white-space: nowrap;">
+                          FECHA: ${fechaInformeStr}
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 40px; background-color: #ffffff;">
+              <p style="margin: 0; color: #475569; font-size: 15px; line-height: 1.6;">Buenas,</p>
+              <p style="margin-top: 16px; color: #475569; font-size: 15px; line-height: 1.6;">
+                Nuestros operarios se desplazaron a vuestras instalaciones para arreglar un palet de nuestra tienda <b style="color: #000000;">${tienda.toUpperCase()}</b>, presentando bultos/mercancia faltantes.
+              </p>
+              <p style="margin-top: 16px; color: #475569; font-size: 15px; line-height: 1.6;">
+                Tras haber revisado la mercancia en vuestras instalaciones, os podemos confirmar que se han producido algunas <b style="color: #ef4444;">FALTAS</b>.<br><br> 
+                Mis compañeros en los próximos días os pasará el cargo correspondiente.
+              </p>
+              <p style="margin-top: 16px; color: #1e293b; font-size: 15px; line-height: 1.6; font-weight: 600;">
+                Es vital que tengáis especial cuidado con nuestra mercancía puesto que es muy frágil y costosa. <br><br>El hecho de que se produzcan estas incidencias nos afecta en las ventas y en el normal funcionamiento de la tienda.
+              </p>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top: 10px;">
+              <tr>
+              <td align="center"> <p style="color: #475569; font-size: 15px; line-height: 1.6; margin: 0; text-align: center;"> Atentamente,<br>
+              <b style="color: #1e293b;">Departamento de Transporte</b>
+              </p>
+             <p style="margin-top: 16px; margin-bottom: 0; text-align: center;">
+             <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/5/5b/Primor_Logo.png/960px-Primor_Logo.png" 
+             alt="PRIMOR" 
+             width="150" 
+             style="display: inline-block; border:0; margin: 0 auto;"> </p>
+            </td>
+            </tr>
+          </table>
+          <tr>
+            <td align="center" bgcolor="#f8fafc" style="padding: 20px; border-top: 1px solid #f1f5f9;">
+              <span style="font-family: Arial, sans-serif; font-size: 9px; color: #cbd5e1; font-weight: 400; text-transform: uppercase; letter-spacing: 2px;">
+              CORREO GENERADO AUTOMATICAMENTE POR EL SISTEMA GIDT
+              </span>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</div>`;
+  }
+
+  // Igual que la de ROTURA en almacén de agencia (con la frase de recogida
+  // y el aviso de fecha límite), pero mencionando roturas Y faltas.
+  function plantillaHtmlMixtoAgencia(tienda, fechaInformeStr, fechaLimite) {
+    return `
+<div style="font-family: Arial, sans-serif; background-color: #f4f7fa; padding: 20px;">
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#f4f7fa">
+    <tr>
+      <td align="center">
+        <table width="600" cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" style="border: 1px solid #edf2f7; border-radius: 24px;">
+          <tr>
+            <td align="center" style="padding: 32px 40px; border-bottom: 1px solid #f1f5f9;">
+              <h2 style="margin: 0; color: #1e293b; font-family: Arial, sans-serif; font-size: 18px; font-weight: 800; letter-spacing: 1px; text-transform: uppercase;">
+                AVISO DE ROTURAS Y <span style="color: #ff0000;">FALTAS</span><br> EN NUESTRO PALET DE TIENDA
+              </h2>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr><td height="20" style="font-size: 1px; line-height: 1px;">&nbsp;</td></tr>
+              </table>
+              <table cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td style="padding: 4px;">
+                    <table cellpadding="0" cellspacing="0" border="0" bgcolor="#fef2f2" style="background-color: #fef2f2; border: 1px solid #fee2e2; border-radius: 20px;">
+                      <tr>
+                        <td style="padding: 6px 16px; font-family: Arial, sans-serif; font-size: 13px; font-weight: 700; color: #ef4444; text-transform: uppercase; white-space: nowrap;">
+                          Tienda: ${tienda.toUpperCase()}
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                  <td style="padding: 4px;">
+                    <table cellpadding="0" cellspacing="0" border="0" bgcolor="#f1f5f9" style="background-color: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 20px;">
+                      <tr>
+                        <td style="padding: 6px 16px; font-family: Arial, sans-serif; font-size: 13px; font-weight: 700; color: #475569; text-transform: uppercase; white-space: nowrap;">
+                          FECHA: ${fechaInformeStr}
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 40px; background-color: #ffffff;">
+              <p style="margin: 0; color: #475569; font-size: 15px; line-height: 1.6;">Buenas,</p>
+              <p style="margin-top: 16px; color: #475569; font-size: 15px; line-height: 1.6;">
+                Nuestros operarios se desplazaron a vuestras instalaciones para arreglar un palet de nuestra tienda <b style="color: #000000;">${tienda.toUpperCase()}</b>, presentando bultos faltantes y bultos rotos y golpeados.
+              </p>
+              <p style="margin-top: 16px; color: #475569; font-size: 15px; line-height: 1.6;">
+                Tras haber revisado la mercancia en vuestras instalaciones, os podemos confirmar que se han producido algunas <b style="color: #000000;">ROTURAS</b> y <b style="color: #ef4444;">FALTAS</b>.<br><br> 
+                Mis compañeros en los próximos días os pasará el cargo correspondiente.
+              </p>
+              <p style="margin-top: 16px; color: #1e293b; font-size: 15px; line-height: 1.6; font-weight: 600;">
+                Es vital que tengáis especial cuidado con nuestra mercancía puesto que es muy frágil y costosa. <br><br>El hecho de que se produzcan estas incidencias nos afecta en las ventas y en el normal funcionamiento de la tienda.<br><br>La mercancia dañada la podreis recoger en nuestro almacen de Calle Escritora Carmen Martin Gaite Nº10, preguntando por Jose Luis Franco.
+              </p>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0" role="presentation">
+                <tr>
+                  <td align="center" style="padding: 20px 0;">
+                    <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color: #fffbeb; border: 1px solid #fef3c7; border-radius: 20px;">
+                      <tr>
+                        <td align="center" style="padding: 30px 20px;">
+                          <table cellpadding="0" cellspacing="0" border="0">
+                            <tr>
+                              <td align="center" style="padding-bottom: 15px; color: #b45309; font-family: Arial, sans-serif; font-size: 13px; font-weight: bold; text-transform: uppercase; letter-spacing: 1px;">
+                                ⚠️ ACCIÓN REQUERIDA (SEGURO/RECOGIDA)
+                              </td>
+                            </tr>
+                          </table>
+                          <table cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" style="border: 1px solid #fde68a; border-radius: 12px; width: 280px;">
+                            <tr>
+                              <td align="center" style="padding: 20px;">
+                                <div style="font-family: Arial, sans-serif; font-size: 11px; color: #b45309; font-weight: bold; text-transform: uppercase;">
+                                  FECHA LÍMITE DE RECOGIDA:
+                                </div>
+                                <div style="font-family: Arial, sans-serif; font-size: 28px; font-weight: 800; color: #d97706; margin-top: 5px;">
+                                  ${fechaLimite}
+                                </div>
+                              </td>
+                            </tr>
+                          </table>
+                          <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                            <tr><td height="35" style="font-size: 1px; line-height: 1px;">&nbsp;</td></tr>
+                          </table>
+                          <table width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width: 480px;">
+                            <tr>
+                              <td align="center" style="font-family: Arial, sans-serif; font-size: 12px; color: #92400e; font-style: italic; line-height: 18px;">
+                                * En caso de necesitar la mercancía averiada para el seguro se deberá recoger en nuestro almacen arriba indicado en los próximos 15 días.
+                              </td>
+                            </tr>
+                            <tr><td height="15" style="font-size: 1px; line-height: 1px;">&nbsp;</td></tr>
+                            <tr>
+                              <td align="center" style="font-family: Arial, sans-serif; font-size: 12px; color: #92400e; font-style: italic; line-height: 18px;">
+                                Transcurrido la fecha limite más arriba indicada, procederemos a su destrucción y no podrá reclamarnos dicha mercancía.
+                              </td>
+                            </tr>
+                          </table>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top: 10px; border-top: 0px solid #f1f5f9; padding-top: 0px;">
+              <tr>
+              <td align="center"> <p style="color: #475569; font-size: 15px; line-height: 1.6; margin: 0; text-align: center;"> Atentamente,<br>
+              <b style="color: #1e293b;">Departamento de Transporte</b>
+              </p>
+             <p style="margin-top: 16px; margin-bottom: 0; text-align: center;">
+             <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/5/5b/Primor_Logo.png/960px-Primor_Logo.png" 
+             alt="PRIMOR" 
+             width="150" 
+             style="display: inline-block; border:0; margin: 0 auto;"> </p>
+            </td>
+            </tr>
+          </table>
+          <tr>
+            <td align="center" bgcolor="#f8fafc" style="padding: 20px; border-top: 1px solid #f1f5f9;">
+              <span style="font-family: Arial, sans-serif; font-size: 9px; color: #cbd5e1; font-weight: 400; text-transform: uppercase; letter-spacing: 2px;">
+              CORREO GENERADO AUTOMATICAMENTE POR EL SISTEMA GIDT
+              </span>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</div>`;
+  }
+
+  // Genera { subject, html, text } para un siniestro con origen mercancía
+  // = AGENCIA (rotura/falta detectada al reparar un palet en el propio
+  // almacén de la agencia, no en la entrega a tienda). s debe traer
+  // también agenciaNombre.
+  function plantillaSiniestroAgencia(s, fechaInformeISO) {
+    const t = s.incidencia.tiendas || {};
+    const tienda = t.nombre || '—';
+    const agenciaNombre = s.agenciaNombre || '—';
+    const fechaInformeStr = fechaEs(fechaInformeISO);
+    const fechaLimite = fechaEs(s.fecha_limite);
+
+    let html, subject, text;
+
+    if (s.tipo === 'ROTURA') {
+      html = plantillaHtmlRoturaAgencia(tienda, fechaInformeStr, fechaLimite);
+      subject = `ROTURA EN ALMACEN ${agenciaNombre.toUpperCase()} - ${tienda.toUpperCase()} - ${fechaInformeStr}`;
+      text = `Rotura detectada en el almacén de ${agenciaNombre} al reparar un palet de la tienda ${tienda} (fecha ${fechaInformeStr}). Fecha límite de recogida: ${fechaLimite}.`;
+    } else if (s.tipo === 'MIXTO') {
+      html = plantillaHtmlMixtoAgencia(tienda, fechaInformeStr, fechaLimite);
+      subject = `ROTURA Y FALTA EN ALMACEN ${agenciaNombre.toUpperCase()} - ${tienda.toUpperCase()} - ${fechaInformeStr}`;
+      text = `Rotura y falta detectadas en el almacén de ${agenciaNombre} al reparar un palet de la tienda ${tienda} (fecha ${fechaInformeStr}). Fecha límite de recogida: ${fechaLimite}.`;
+    } else {
+      html = plantillaHtmlFaltaAgencia(tienda, fechaInformeStr);
+      subject = `FALTA EN ALMACEN ${agenciaNombre.toUpperCase()} - ${tienda.toUpperCase()} - ${fechaInformeStr}`;
+      text = `Falta detectada en el almacén de ${agenciaNombre} al reparar un palet de la tienda ${tienda} (fecha ${fechaInformeStr}).`;
+    }
+
+    if (!t.nombre) {
+      html = adaptarHtmlSinTienda(html, s.informacion);
+      subject = asuntoSinTienda(subject);
+      text = text.replace(/ de la tienda —/, '') + (s.informacion ? ` Detalle: ${s.informacion}` : '');
+    }
+
+    return { subject, html, text };
+  }
+
+  // ---------------------------------------------------------------
+  // Correos POSTERIORES al primer aviso a la agencia (Panel siniestros):
+  //  - ACTUALIZACIÓN: el tipo del siniestro cambió después de enviarlo
+  //    (en el informe se añadieron o quitaron roturas/faltas). Es la
+  //    plantilla de siempre del tipo NUEVO, con un recuadro naranja arriba
+  //    que explica qué ha cambiado respecto al aviso anterior.
+  //  - ANULACIÓN: el siniestro pasa a ANULADO y se avisa a la agencia de
+  //    que no se le pasará cargo.
+  // Los tipos son los de plantilla: ROTURA / FALTA / MIXTO.
+  // ---------------------------------------------------------------
+
+  const TIPO_PLANTILLA_TXT = { ROTURA: 'roturas', FALTA: 'faltas', MIXTO: 'roturas y faltas' };
+
+  // "19/11/2026 a las 10:30" (hora de Madrid, la del navegador)
+  function fechaHoraEsCorreo(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (isNaN(d)) return '';
+    const dd = String(d.getDate()).padStart(2, '0');
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mi = String(d.getMinutes()).padStart(2, '0');
+    return `${dd}/${mm}/${d.getFullYear()} a las ${hh}:${mi}`;
+  }
+
+  // Frase (HTML) que explica a la agencia el cambio de tipo.
+  function textoCambioTipoSiniestro(antes, despues) {
+    const conRoturas = t => t === 'ROTURA' || t === 'MIXTO';
+    const conFaltas = t => t === 'FALTA' || t === 'MIXTO';
+    const anadidas = [];
+    const quitadas = [];
+    if (conRoturas(despues) && !conRoturas(antes)) anadidas.push('roturas');
+    if (conFaltas(despues) && !conFaltas(antes)) anadidas.push('faltas');
+    if (conRoturas(antes) && !conRoturas(despues)) quitadas.push('roturas');
+    if (conFaltas(antes) && !conFaltas(despues)) quitadas.push('faltas');
+    if (anadidas.length && !quitadas.length) {
+      return `Además de las ${TIPO_PLANTILLA_TXT[antes]} que os comunicamos, se han detectado <b>${anadidas.join(' y ')}</b> en este mismo envío.`;
+    }
+    if (quitadas.length && !anadidas.length) {
+      return `Rectificamos el aviso anterior: finalmente <b>no hay ${quitadas.join(' ni ')}</b> en este envío. Se mantienen únicamente las ${TIPO_PLANTILLA_TXT[despues]} comunicadas.`;
+    }
+    // Cambio cruzado (p. ej. lo que se avisó como roturas son faltas)
+    return `Rectificamos el aviso anterior: lo que os comunicamos como <b>${TIPO_PLANTILLA_TXT[antes]}</b> son en realidad <b>${TIPO_PLANTILLA_TXT[despues]}</b>.`;
+  }
+
+  // Recuadro naranja que va encima del título del correo.
+  function cajaAvisoCorreoHtml(tituloHtml, cuerpoHtml) {
+    return `
+          <tr>
+            <td style="padding: 18px 40px 0;">
+              <table width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#fff7ed" style="background-color: #fff7ed; border: 1px solid #fed7aa; border-radius: 14px;">
+                <tr>
+                  <td style="padding: 12px 16px; font-family: Arial, sans-serif; font-size: 13px; color: #9a3412; line-height: 1.5;">
+                    <b style="text-transform: uppercase;">${tituloHtml}</b><br>${cuerpoHtml}
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>`;
+  }
+
+  // Mete un bloque justo al principio de la tarjeta blanca de la plantilla.
+  function insertarAlInicioDelCorreo(html, bloque) {
+    return html.replace(/(<table width="600"[^>]*>)/, `$1${bloque}`);
+  }
+
+  // sPlantilla: igual que para plantillaSiniestro (tipo NUEVO), opciones:
+  //   tipoAnterior: tipo con el que se comunicó la última vez
+  //   comunicadoEn: ISO de esa última comunicación
+  //   agencia: true si el origen es AGENCIA (usa esas plantillas)
+  function plantillaActualizacionSiniestro(sPlantilla, fechaInformeISO, { tipoAnterior, comunicadoEn, agencia = false } = {}) {
+    const base = agencia ? plantillaSiniestroAgencia(sPlantilla, fechaInformeISO) : plantillaSiniestro(sPlantilla, fechaInformeISO);
+    const cuando = fechaHoraEsCorreo(comunicadoEn);
+    const cambio = textoCambioTipoSiniestro(tipoAnterior, sPlantilla.tipo);
+    const titulo = cuando ? `Actualización del aviso enviado el ${cuando}` : 'Actualización del aviso anterior';
+    const html = insertarAlInicioDelCorreo(base.html, cajaAvisoCorreoHtml(titulo, `${cambio} Este correo sustituye al anterior.`));
+    const textoCambio = cambio.replace(/<[^>]+>/g, '');
+    return {
+      subject: `ACTUALIZACIÓN – ${base.subject}`,
+      html,
+      text: `${titulo.toUpperCase()}. ${textoCambio} Este correo sustituye al anterior.\n\n${base.text}`
+    };
+  }
+
+  function plantillaHtmlAnulacion({ tienda, fechaInformeStr, tipoTxt, cuandoTxt, lugarHtml, conRecogida }) {
+    const chipTienda = tienda ? `
+                  <td style="padding: 4px;">
+                    <table cellpadding="0" cellspacing="0" border="0" bgcolor="#fef2f2" style="background-color: #fef2f2; border: 1px solid #fee2e2; border-radius: 20px;">
+                      <tr>
+                        <td style="padding: 6px 16px; font-family: Arial, sans-serif; font-size: 13px; font-weight: 700; color: #ef4444; text-transform: uppercase; white-space: nowrap;">
+                          Tienda: ${escapeHtml(tienda.toUpperCase())}
+                        </td>
+                      </tr>
+                    </table>
+                  </td>` : '';
+    const chipVerde = (txt) => `
+                              <td style="padding: 4px;">
+                                <table cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" style="border: 1px solid #bbf7d0; border-radius: 12px;">
+                                  <tr><td align="center" style="padding: 12px 20px; font-family: Arial, sans-serif; font-size: 13px; font-weight: 700; color: #166534;">${txt}</td></tr>
+                                </table>
+                              </td>`;
+    return `
+<div style="font-family: Arial, sans-serif; background-color: #f4f7fa; padding: 20px;">
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#f4f7fa">
+    <tr>
+      <td align="center">
+        <table width="600" cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" style="border: 1px solid #edf2f7; border-radius: 24px;">
+          <tr>
+            <td align="center" style="padding: 32px 40px; border-bottom: 1px solid #f1f5f9;">
+              <h2 style="margin: 0; color: #1e293b; font-family: Arial, sans-serif; font-size: 18px; font-weight: 800; letter-spacing: 1px; text-transform: uppercase;">
+                ANULACIÓN DEL AVISO<br> DE INCIDENCIA EN LA ENTREGA
+              </h2>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr><td height="20" style="font-size: 1px; line-height: 1px;">&nbsp;</td></tr>
+              </table>
+              <table cellpadding="0" cellspacing="0" border="0">
+                <tr>${chipTienda}
+                  <td style="padding: 4px;">
+                    <table cellpadding="0" cellspacing="0" border="0" bgcolor="#f1f5f9" style="background-color: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 20px;">
+                      <tr>
+                        <td style="padding: 6px 16px; font-family: Arial, sans-serif; font-size: 13px; font-weight: 700; color: #475569; text-transform: uppercase; white-space: nowrap;">
+                          ${tienda ? 'Recepción' : 'Fecha'}: ${fechaInformeStr}
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 40px; background-color: #ffffff;">
+              <p style="margin: 0; color: #475569; font-size: 15px; line-height: 1.6;">Buenas,</p>
+              <p style="margin-top: 16px; color: #475569; font-size: 15px; line-height: 1.6;">
+                Os escribimos en relación con el aviso de <b style="color: #000000;">${tipoTxt.toUpperCase()}</b> que os enviamos${cuandoTxt ? ` el <b style="color: #000000;">${cuandoTxt}</b>` : ''} ${lugarHtml}.
+              </p>
+              <p style="margin-top: 16px; color: #475569; font-size: 15px; line-height: 1.6;">
+                Tras revisar de nuevo el caso, os confirmamos que esta incidencia <b style="color: #000000;">queda ANULADA</b>. Por favor, no tengáis en cuenta el aviso anterior.
+              </p>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0" role="presentation">
+                <tr>
+                  <td align="center" style="padding: 20px 0;">
+                    <table width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#f0fdf4" style="background-color: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 20px;">
+                      <tr>
+                        <td align="center" style="padding: 26px 20px;">
+                          <div style="font-family: Arial, sans-serif; font-size: 13px; font-weight: bold; color: #15803d; text-transform: uppercase; letter-spacing: 1px; padding-bottom: 14px;">✅ INCIDENCIA ANULADA</div>
+                          <table cellpadding="0" cellspacing="0" border="0">
+                            <tr>${chipVerde('Sin cargo')}${conRecogida ? chipVerde('Sin recogida de mercancía') : ''}
+                            </tr>
+                          </table>
+                          <div style="font-family: Arial, sans-serif; font-size: 12px; color: #166534; font-style: italic; line-height: 18px; padding-top: 16px; max-width: 460px;">
+                            No se os pasará ningún cargo por esta incidencia${conRecogida ? ' y no es necesario pasar a recoger la mercancía' : ''}.
+                          </div>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top: 10px;">
+                <tr>
+                  <td align="center">
+                    <p style="color: #475569; font-size: 15px; line-height: 1.6; margin: 0; text-align: center;">Atentamente,<br>
+                      <b style="color: #1e293b;">Departamento de Transporte</b>
+                    </p>
+                    <p style="margin-top: 16px; margin-bottom: 0; text-align: center;">
+                      <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/5/5b/Primor_Logo.png/960px-Primor_Logo.png" alt="PRIMOR" width="150" style="display: inline-block; border:0; margin: 0 auto;">
+                    </p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td align="center" bgcolor="#f8fafc" style="padding: 20px; border-top: 1px solid #f1f5f9;">
+              <span style="font-family: Arial, sans-serif; font-size: 9px; color: #cbd5e1; font-weight: 400; text-transform: uppercase; letter-spacing: 2px;">
+                CORREO GENERADO AUTOMATICAMENTE POR EL SISTEMA GIDT
+              </span>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</div>`;
+  }
+
+  // sPlantilla.tipo = tipo con el que se comunicó la última vez a la agencia.
+  // opciones: comunicadoEn (ISO de esa última comunicación), agencia (origen AGENCIA).
+  function plantillaAnulacionSiniestro(sPlantilla, fechaInformeISO, { comunicadoEn, agencia = false } = {}) {
+    const base = agencia ? plantillaSiniestroAgencia(sPlantilla, fechaInformeISO) : plantillaSiniestro(sPlantilla, fechaInformeISO);
+    const tienda = sPlantilla.incidencia?.tiendas?.nombre || '';
+    const tipoTxt = TIPO_PLANTILLA_TXT[sPlantilla.tipo] || 'incidencias';
+    const cuandoTxt = fechaHoraEsCorreo(comunicadoEn);
+    const lugarHtml = agencia
+      ? (tienda
+          ? `sobre el palet de nuestra tienda <b style="color: #000000;">${escapeHtml(tienda.toUpperCase())}</b> que se reparó en vuestro almacén`
+          : 'sobre un palet nuestro que se reparó en vuestro almacén')
+      : (tienda
+          ? `sobre la mercancía recibida en nuestra tienda de <b style="color: #000000;">${escapeHtml(tienda.toUpperCase())}</b> (ver fecha de recepción arriba)`
+          : 'sobre un envío de mercancía (ver fecha arriba)');
+    const html = plantillaHtmlAnulacion({
+      tienda,
+      fechaInformeStr: fechaEs(fechaInformeISO),
+      tipoTxt,
+      cuandoTxt,
+      lugarHtml,
+      conRecogida: sPlantilla.tipo !== 'FALTA'
+    });
+    return {
+      subject: `ANULACIÓN – ${base.subject}`,
+      html,
+      text: `Anulamos el aviso de ${tipoTxt} que os enviamos${cuandoTxt ? ' el ' + cuandoTxt : ''}${tienda ? ` (tienda ${tienda})` : ''}. Esta incidencia queda ANULADA: no se os pasará ningún cargo${sPlantilla.tipo !== 'FALTA' ? ' y no es necesario recoger la mercancía' : ''}.`
+    };
+  }
+
+  // ---------------------------------------------------------------
+  // Correo a Facturación (envío del albarán + fotos de un siniestro del
+  // Panel siniestros). Antes vivía en panel-siniestros.js — movida aquí
+  // porque este archivo es el sitio de todas las plantillas de correo.
+  // ---------------------------------------------------------------
+
+  const PS_TIPO_CUERPO_FACTURACION = {
+    ROTURA: (tienda) => `todas las fotos de la rotura en la tienda de ${tienda}`,
+    FALTAS: (tienda) => `todas las fotos y productos que han faltado en la tienda de ${tienda}`,
+    'FALTAS Y ROTURAS': (tienda) => `todas las fotos y productos afectados (roturas y faltas) en la tienda de ${tienda}`
+  };
+
+  // Asunto por tipo de siniestro: tienda, agencia (si se pasa), fecha del
+  // siniestro y nombre comercial de la agencia (si se pasa).
+  function psAsuntoFacturacion(tipo, tienda, fecha, agenciaNombre, nombreComercial) {
+    const t = tienda.toUpperCase();
+    const partes = t ? [t] : []; // sin tienda: no se pone
+    if (agenciaNombre) partes.push(agenciaNombre.toUpperCase());
+    partes.push(fecha);
+    if (nombreComercial) partes.push(nombreComercial.toUpperCase());
+    const base = partes.join(' - ');
+    if (tipo === 'ROTURA') return `INCIDENCIA POR ROTURAS EN ${base}`;
+    // FALTAS y FALTAS Y ROTURAS comparten el mismo asunto.
+    return `FALTAS EN EL ENVIO E INCIDENCIA POR ROTURAS EN ${base}`;
+  }
+
+  // Construye el correo tal cual lo redactáis a mano hoy: asunto según el
+  // tipo de siniestro (tienda, agencia, fecha y nombre comercial de la
+  // agencia), cuerpo sencillo en texto plano, fotos + PDF adjuntos.
+  function plantillaFacturacionAlbaran(s, nombreComercialAgencia) {
+    const fecha = fechaEs(s.fecha);
+    const tienda = s.tienda_nombre || '';
+    const subject = psAsuntoFacturacion(s.tipo, tienda, fecha, s.agencia_nombre, nombreComercialAgencia);
+
+    const linea = (PS_TIPO_CUERPO_FACTURACION[s.tipo] || ((t) => `toda la documentación de la incidencia en la tienda de ${t}`))(tienda);
+
+    // En los siniestros mixtos (rotura + falta) se aclara qué es cada cosa,
+    // ya que en las fotos/albarán lo subrayado en amarillo marca las FALTAS.
+    // Sin tienda: "en la tienda de X" pasa a "en un envío de mercancía" y
+    // se añade lo escrito en Información como detalle.
+    const sinTienda = !tienda;
+    const lineaFinal = sinTienda
+      ? linea.replace(/ en la tienda de $/, ' en un envío de mercancía').replace(/ de la tienda de $/, '')
+      : linea;
+    const detalleInfo = sinTienda && s.informacion ? `Detalle: ${s.informacion}` : '';
+    const aclaracionFaltas = s.tipo === 'FALTAS Y ROTURAS'
+      ? 'Aclaramos que lo subrayado en amarillo son las FALTAS'
+      : '';
+
+    const html = `
+      <div style="font-family:Arial, sans-serif; font-size:14px; color:#1e293b; line-height:1.5;">
+        <p style="margin:0 0 14px;">Buenas, aquí adjuntamos ${lineaFinal}</p>${detalleInfo ? `<p style="margin:0 0 14px;">${escapeHtml(detalleInfo)}</p>` : ''}
+        <p style="margin:0 0 14px;">De la agencia ${escapeHtml(s.agencia_nombre || '')}, el día: ${fecha}</p>
+        ${aclaracionFaltas ? `<p style="margin:0 0 14px;">${aclaracionFaltas}</p>` : ''}
+        <p style="margin:0;">Gracias, un saludo.</p>
+      </div>`;
+
+    const text = `Buenas, aquí adjuntamos ${lineaFinal}${detalleInfo ? `\n${detalleInfo}` : ''}\nDe la agencia ${s.agencia_nombre || ''}, el día: ${fecha}${aclaracionFaltas ? `\n\n${aclaracionFaltas}` : ''}\n\nGracias, un saludo.`;
+
+    return { subject, html, text };
+  }
+
+  // ---------------------------------------------------------------
+  // Correo a Facturación cuando el pallet se arregló en vuestro almacén
+  // de Málaga (origen = 'AGENCIA'), no en la tienda. Asunto propio (ver
+  // psAsuntoFacturacionAgencia), formato acordado:
+  // "INCIDENCIA POR ROTURA EN ALMACÉN TXT - MORALEJA - 21/07/2026 - TRANSXTAR S.L."
+  // El nombre comercial se muestra tal cual está guardado en la ficha de
+  // la agencia (Configuración → Emails), sin añadir nada más: si esa
+  // agencia quiere que su abreviatura salga entre paréntesis (p. ej.
+  // "JUAN Y RAFAEL NAVARRO. (PALLEX)"), se escribe así directamente en el
+  // campo "Nombre comercial" de la agencia, no aquí.
+  // ---------------------------------------------------------------
+
+  // Motivo en singular ("ROTURA", "FALTA", "ROTURA Y FALTA"), a diferencia
+  // del asunto de tienda (psAsuntoFacturacion) que usa plural.
+  const PS_MOTIVO_FACTURACION_AGENCIA = {
+    ROTURA: 'ROTURA',
+    FALTAS: 'FALTA',
+    'FALTAS Y ROTURAS': 'ROTURA Y FALTA'
+  };
+
+  function psAsuntoFacturacionAgencia(tipo, tienda, fecha, agenciaNombre, nombreComercial) {
+    const ag = (agenciaNombre || '').toUpperCase();
+    const t = tienda.toUpperCase();
+    let base = [ag, t, fecha].filter(Boolean).join(' - ');
+    if (nombreComercial) base += ` // ${nombreComercial.toUpperCase()}`;
+    const motivo = PS_MOTIVO_FACTURACION_AGENCIA[tipo] || 'ROTURA Y FALTA';
+    return `INCIDENCIA POR ${motivo} EN ALMACÉN ${base}`;
+  }
+
+  const PS_TIPO_CUERPO_FACTURACION_AGENCIA = {
+    ROTURA: (tienda) => `todas las fotos del pallet arreglado en vuestro almacén de Málaga de la tienda de ${tienda}`,
+    FALTAS: (tienda) => `todas las fotos y los productos que han faltado del pallet arreglado en vuestro almacén de Málaga de la tienda de ${tienda}`,
+    'FALTAS Y ROTURAS': (tienda) => `todas las fotos y productos afectados (roturas y faltas) del pallet arreglado en vuestro almacén de Málaga de la tienda de ${tienda}`
+  };
+
+  function plantillaFacturacionAlbaranAgencia(s, nombreComercialAgencia) {
+    const fecha = fechaEs(s.fecha);
+    const tienda = s.tienda_nombre || '';
+    const subject = psAsuntoFacturacionAgencia(s.tipo, tienda, fecha, s.agencia_nombre, nombreComercialAgencia);
+
+    const linea = (PS_TIPO_CUERPO_FACTURACION_AGENCIA[s.tipo] || ((t) => `toda la documentación del pallet arreglado en vuestro almacén de Málaga de la tienda de ${t}`))(tienda);
+
+    // Sin tienda: "en la tienda de X" pasa a "en un envío de mercancía" y
+    // se añade lo escrito en Información como detalle.
+    const sinTienda = !tienda;
+    const lineaFinal = sinTienda
+      ? linea.replace(/ en la tienda de $/, ' en un envío de mercancía').replace(/ de la tienda de $/, '')
+      : linea;
+    const detalleInfo = sinTienda && s.informacion ? `Detalle: ${s.informacion}` : '';
+    const aclaracionFaltas = s.tipo === 'FALTAS Y ROTURAS'
+      ? 'Aclaramos que lo subrayado en amarillo son las FALTAS'
+      : '';
+
+    const html = `
+      <div style="font-family:Arial, sans-serif; font-size:14px; color:#1e293b; line-height:1.5;">
+        <p style="margin:0 0 14px;">Buenas, aquí adjuntamos ${lineaFinal}</p>${detalleInfo ? `<p style="margin:0 0 14px;">${escapeHtml(detalleInfo)}</p>` : ''}
+        <p style="margin:0 0 14px;">De la agencia ${escapeHtml(s.agencia_nombre || '')}, el día: ${fecha}</p>
+        ${aclaracionFaltas ? `<p style="margin:0 0 14px;">${aclaracionFaltas}</p>` : ''}
+        <p style="margin:0;">Gracias, un saludo.</p>
+      </div>`;
+
+    const text = `Buenas, aquí adjuntamos ${lineaFinal}${detalleInfo ? `\n${detalleInfo}` : ''}\nDe la agencia ${s.agencia_nombre || ''}, el día: ${fecha}${aclaracionFaltas ? `\n\n${aclaracionFaltas}` : ''}\n\nGracias, un saludo.`;
+
+    return { subject, html, text };
+  }

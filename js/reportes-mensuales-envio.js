@@ -1,0 +1,1051 @@
+// js/reportes-mensuales-envio.js
+// ---------------------------------------------------------------
+// Análisis · Reportes mensuales → botón "Enviar a agencias".
+//
+// Genera, para el mes que se esté viendo en Reportes mensuales (rmAnio /
+// rmMes de reportes-mensuales.js), el mismo PDF "ENTREGAS MERCANCIA
+// AGENCIA" que antes se mandaba a mano (mismo título, misma leyenda de
+// códigos, misma tabla Agencia/Tienda/Provincia/días/Total), y lo envía
+// por correo a los emails configurados de cada agencia (Configuración →
+// Gestión de agencias), con el PDF adjunto.
+//
+// Agrupación: varias filas de "agencias" pueden ser en realidad la misma
+// empresa cliente (p.ej. "CBL EXTERNO" y "CBL MLG" son ambas CBL). Para
+// que se envíen juntas en un único PDF/correo, se les asigna el mismo
+// "grupo_envio" desde Configuración → Gestión de agencias. Sin grupo, cada
+// agencia se envía sola (su grupo es su propio nombre).
+//
+// "Ya enviado": se guarda una fila por (grupo, año, mes) en la tabla
+// informes_mensuales_agencia_enviados (ver supabase/2026-09_reportes_
+// mensuales_envio.sql) para poder mostrar el estado y evitar reenvíos
+// accidentales. El botón "Enviar a todas las pendientes" solo manda a
+// las agencias que todavía no tengan ese registro este mes.
+//
+// El PDF se manda como adjunto directo del correo (en base64, ver
+// email-service.js), sin subirlo a ningún sitio: no hay dónde verlo desde
+// la app y solo ocuparía espacio de Storage sin necesidad.
+//
+// Solo se puede enviar el resumen de un mes ya terminado (no el mes en
+// curso): ver rmeMesHaTerminado().
+//
+// Requiere (ya cargados antes): sb, escapeHtml, modalAlert, modalConfirm,
+// mostrarCargandoEnvio, actualizarCargandoEnvio, ocultarCargandoEnvio
+// (informe-envio.js), enviarEmail, sesionActual, plantillaHtmlResumenMensual,
+// rmAnio, rmMes, RM_NOMBRES_MES, rmCargarDatosMes, rmConstruirTodasLasFilas,
+// CODIGOS_INFORME, pdfDisponible(), tienePermiso() (permisos.js).
+// ---------------------------------------------------------------
+
+// Un mes solo se puede enviar cuando ya ha terminado del todo (nunca el
+// mes en curso, aunque estemos a final de mes: podrían faltar días por
+// cerrar). anio/mesIndex en el mismo formato que rmAnio/rmMes (mes 0-11).
+function rmeMesHaTerminado(anio, mesIndex) {
+  const hoy = new Date();
+  if (anio < hoy.getFullYear()) return true;
+  if (anio > hoy.getFullYear()) return false;
+  return mesIndex < hoy.getMonth();
+}
+
+function rmeMesNombreCapitalizado(mesIndex) {
+  const n = RM_NOMBRES_MES[mesIndex] || '';
+  return n.charAt(0) + n.slice(1).toLowerCase();
+}
+
+function rmeTituloMes(anio, mesIndex) {
+  return `${RM_NOMBRES_MES[mesIndex]} ${anio}`;
+}
+
+// Clave de agrupación de una agencia: su grupo_envio si lo tiene, si no
+// su propio nombre (así, sin configurar nada, cada agencia se envía sola).
+function rmeClaveGrupo(agencia) {
+  return (agencia.grupo_envio && agencia.grupo_envio.trim()) || agencia.nombre;
+}
+
+function rmeMesAnioTexto(mesIndex, anio) {
+  return `${rmeMesNombreCapitalizado(mesIndex)} de ${anio}`;
+}
+
+// Nombre "bonito" del PDF: el que ver\u00e1 el destinatario como adjunto del
+// correo (se manda directo, en base64, sin pasar por Storage).
+function rmeNombreArchivo(grupoNombre, anio, mesIndex, diaDesde, diaHasta, totalDias) {
+  const rango = (diaDesde && diaHasta && totalDias && !(diaDesde === 1 && diaHasta === totalDias))
+    ? ` (día ${diaDesde}-${diaHasta})` : '';
+  return `${grupoNombre} - ${rmeTituloMes(anio, mesIndex)}${rango}.pdf`;
+}
+
+// A partir del listado fresco de agencias (con emails y grupo_envio),
+// construye los grupos de envío: { clave, nombre, agenciaIds[], agenciasNombres[], emails[], orden }
+function rmeConstruirGrupos(agenciasFrescas) {
+  const porClave = new Map();
+  agenciasFrescas.forEach(ag => {
+    const clave = rmeClaveGrupo(ag);
+    if (!porClave.has(clave)) {
+      porClave.set(clave, { clave, nombre: clave, agenciaIds: [], agenciasNombres: [], emails: new Set(), orden: ag.orden ?? 999999, todasDeBaja: true });
+    }
+    const g = porClave.get(clave);
+    // El grupo solo cuenta como "de baja" si TODAS sus agencias lo están.
+    if (ag.activo !== false) g.todasDeBaja = false;
+    g.agenciaIds.push(ag.id);
+    g.agenciasNombres.push(ag.nombre);
+    (ag.emails || []).forEach(e => g.emails.add(e));
+    g.orden = Math.min(g.orden, ag.orden ?? 999999);
+  });
+  return Array.from(porClave.values())
+    .map(g => ({ ...g, emails: Array.from(g.emails), envio: null }))
+    .sort((a, b) => a.orden - b.orden || a.nombre.localeCompare(b.nombre));
+}
+
+// ---------------------------------------------------------------
+// Panel "Enviar a agencias"
+// ---------------------------------------------------------------
+let rmeEnganchado = false;
+let rmeEnviando = false; // evita doble clic mientras se genera/envía algo
+let rmeGruposActuales = []; // último listado cargado (para el botón "enviar a todas")
+
+function rmePosicionarPanel() {
+  const btn = document.getElementById('btnRmEnviarAgencias');
+  const panel = document.getElementById('rmEnviarPanel');
+  const wrap = btn.closest('.filtros-wrap');
+  const wrapRect = wrap.getBoundingClientRect();
+  const margen = 12;
+  const ancho = Math.min(640, bordeDerechoVisible() - margen * 2);
+  panel.style.width = ancho + 'px';
+  let left = 0;
+  const desbordeDerecha = (wrapRect.left + left + ancho) - (bordeDerechoVisible() - margen);
+  if (desbordeDerecha > 0) left -= desbordeDerecha;
+  if (wrapRect.left + left < margen) left = margen - wrapRect.left;
+  panel.style.left = left + 'px';
+
+  // Alto máximo según el hueco disponible bajo el botón, para que el panel
+  // nunca se salga de la pantalla por abajo (la lista hace scroll interno).
+  // Se limita también por arriba (520px): con muchas agencias, que el panel
+  // no intente ocupar todo el alto de la ventana — a partir de ahí la lista
+  // hace scroll, aunque sobre hueco debajo.
+  const espacioAbajo = window.innerHeight - wrapRect.bottom - margen - 16;
+  panel.style.maxHeight = Math.min(520, Math.max(280, espacioAbajo)) + 'px';
+}
+
+function rmeAbrirPanel() {
+  // Solo un desplegable abierto a la vez: Filtros, Exportar o Enviar.
+  if (typeof rmCerrarFiltrosPanel === 'function') rmCerrarFiltrosPanel();
+  if (typeof rmxCerrarPanel === 'function') rmxCerrarPanel();
+  rmePosicionarPanel();
+  document.getElementById('rmEnviarPanel').classList.add('show');
+  document.getElementById('btnRmEnviarAgencias').classList.add('open');
+  document.getElementById('rmEnviarMesTexto').textContent = rmeTituloMes(rmAnio, rmMes);
+  rmeCargarYRenderPanel();
+}
+function rmeCerrarPanel() {
+  document.getElementById('rmEnviarPanel').classList.remove('show');
+  document.getElementById('btnRmEnviarAgencias').classList.remove('open');
+}
+
+function rmeEngancharPanel() {
+  if (rmeEnganchado) return;
+  rmeEnganchado = true;
+
+  const btn = document.getElementById('btnRmEnviarAgencias');
+  const panel = document.getElementById('rmEnviarPanel');
+
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (panel.classList.contains('show')) rmeCerrarPanel();
+    else rmeAbrirPanel();
+  });
+  panel.addEventListener('click', (e) => e.stopPropagation());
+  document.addEventListener('click', (e) => {
+    if (!panel.contains(e.target) && !btn.contains(e.target)) rmeCerrarPanel();
+  });
+  window.addEventListener('resize', () => {
+    if (panel.classList.contains('show')) rmePosicionarPanel();
+  });
+
+  document.getElementById('btnRmCerrarEnviar').addEventListener('click', rmeCerrarPanel);
+  document.getElementById('btnRmeEnviarTodas').addEventListener('click', () => rmeEnviarTodosPendientes(rmeGruposActuales));
+}
+
+// Carga agencias frescas (con emails/grupo_envio) + los envíos ya
+// registrados para el mes actual, y pinta la lista de grupos.
+async function rmeCargarYRenderPanel() {
+  const cont = document.getElementById('rmEnviarLista');
+  cont.innerHTML = '<div class="empty"><p>Cargando…</p></div>';
+  document.getElementById('rmEnviarMesTexto').textContent = rmeTituloMes(rmAnio, rmMes);
+  const mesTerminado = rmeMesHaTerminado(rmAnio, rmMes);
+  rmeActualizarToolbar([], true, mesTerminado);
+
+  try {
+    const [{ data: agencias, error: e1 }, { data: envios, error: e2 }] = await Promise.all([
+      sb.from('agencias').select('id, nombre, orden, emails, grupo_envio, activo').order('orden'),
+      sb.from('informes_mensuales_agencia_enviados').select('grupo, enviado_en, enviado_por, omitido')
+        .eq('anio', rmAnio).eq('mes', rmMes + 1)
+    ]);
+    if (e1) throw e1;
+    if (e2) throw e2;
+
+    let grupos = rmeConstruirGrupos(agencias || []);
+    const enviosPorGrupo = new Map((envios || []).map(e => [e.grupo, e]));
+    grupos.forEach(g => { g.envio = enviosPorGrupo.get(g.clave) || null; });
+
+    // Mes ya terminado: se mira qué agencias no han tenido ninguna
+    // incidencia (o ninguna tienda) ese mes, para no darlas por pendientes.
+    if (mesTerminado) {
+      try {
+        await rmeMarcarSinIncidencias(grupos, await rmeObtenerDatosMes(), rmAnio, rmMes);
+      } catch (err) {
+        console.error('No se pudo comprobar qué agencias no tienen incidencias este mes:', err);
+      }
+    }
+    // Agencias dadas de baja: solo se muestran en los meses en que
+    // todavía tuvieron tiendas (para poder mandarles su último resumen),
+    // o si ya tienen algo registrado ese mes.
+    grupos = grupos.filter(g => !g.todasDeBaja || g.envio || (mesTerminado && g.totalFilas > 0));
+    rmeGruposActuales = grupos;
+
+    const aviso = mesTerminado ? '' : `
+      <div class="rme-aviso-mes-actual">⏳ Podrás enviar el resumen de ${rmeTituloMes(rmAnio, rmMes)} en cuanto termine el mes.</div>`;
+
+    if (!grupos.length) {
+      cont.innerHTML = aviso + '<div class="empty"><p>No hay agencias configuradas.</p></div>';
+      rmeActualizarToolbar([], false, mesTerminado);
+      return;
+    }
+
+    cont.innerHTML = aviso + grupos.map(g => rmeHtmlFilaGrupo(g, mesTerminado)).join('');
+    rmeActualizarToolbar(grupos, false, mesTerminado);
+
+    if (mesTerminado) {
+      cont.querySelectorAll('[data-rme-enviar]').forEach(b => {
+        b.addEventListener('click', () => rmeEnviarGrupo(b.dataset.rmeEnviar, rmeGruposActuales, cont));
+      });
+      cont.querySelectorAll('[data-rme-omitir]').forEach(b => {
+        b.addEventListener('click', () => rmeOmitirGrupo(b.dataset.rmeOmitir, rmeGruposActuales));
+      });
+      cont.querySelectorAll('[data-rme-deshacer]').forEach(b => {
+        b.addEventListener('click', () => rmeDeshacerOmitido(b.dataset.rmeDeshacer, rmeGruposActuales));
+      });
+    }
+  } catch (err) {
+    console.error('Error cargando el panel de envío del resumen mensual:', err);
+    cont.innerHTML = '<div class="empty"><p style="color:var(--grave);">No se pudo cargar la lista de agencias.</p></div>';
+    rmeActualizarToolbar([], false, mesTerminado);
+  }
+}
+
+// Texto/estado del botón "Enviar a todas las pendientes" según lo cargado.
+// Mientras el mes que se está viendo no haya terminado, el botón queda
+// deshabilitado del todo (nunca se puede enviar el resumen del mes en curso).
+function rmeActualizarToolbar(grupos, cargando, mesTerminado) {
+  const btn = document.getElementById('btnRmeEnviarTodas');
+  const resumen = document.getElementById('rmeResumenTexto');
+  if (!btn || !resumen) return;
+
+  if (cargando) {
+    resumen.textContent = 'Cargando…';
+    btn.disabled = true;
+    btn.textContent = '📤 Enviar a todas las pendientes';
+    return;
+  }
+
+  if (!mesTerminado) {
+    resumen.textContent = grupos.length ? `${grupos.length} agencia${grupos.length === 1 ? '' : 's'}` : '—';
+    btn.disabled = true;
+    btn.textContent = '⏳ Disponible al terminar el mes';
+    return;
+  }
+
+  const pendientes = grupos.filter(rmeEstaPendiente);
+  const sinIncidencias = grupos.filter(g => !g.envio && g.sinIncidencias);
+  const omitidas = grupos.filter(g => g.envio && g.envio.omitido);
+  const extras = [];
+  if (sinIncidencias.length) extras.push(`${sinIncidencias.length} sin incidencias`);
+  if (omitidas.length) extras.push(`${omitidas.length} omitida${omitidas.length === 1 ? '' : 's'}`);
+  resumen.textContent = grupos.length
+    ? `${grupos.length} agencia${grupos.length === 1 ? '' : 's'} · ${pendientes.length} pendiente${pendientes.length === 1 ? '' : 's'} de enviar${extras.length ? ' · ' + extras.join(' · ') : ''}`
+    : '—';
+  btn.disabled = rmeEnviando || !pendientes.length;
+  btn.textContent = pendientes.length
+    ? `📤 Enviar a todas las pendientes (${pendientes.length})`
+    : '✅ Nada pendiente';
+}
+
+// Una agencia/grupo cuenta como pendiente si todavía no tiene registro
+// este mes (ni enviado ni omitido a mano) y sí ha tenido incidencias.
+// Las que no han tenido ninguna incidencia en todo el mes no se dan por
+// pendientes (se pueden enviar igualmente desde su fila si se quiere).
+function rmeEstaPendiente(g) {
+  return !g.envio && !g.sinIncidencias;
+}
+
+// Marca en cada grupo g.totalFilas y g.sinIncidencias (true si en todo el
+// mes sus tiendas no han tenido ninguna incidencia, o si no ha tenido
+// ninguna tienda). Cuenta las incidencias igual que la columna "Total"
+// del PDF, para que coincida siempre con lo que se enviaría.
+async function rmeMarcarSinIncidencias(grupos, datosMes, anio, mesIndex) {
+  const { celdas, diasEnviados, totalDias, todasLasFilas, puntualAgenciaPorTienda } = datosMes;
+  const segmentosPorTienda = rmSegmentosPorTienda(todasLasFilas);
+  grupos.forEach(g => {
+    const filas = todasLasFilas.filter(f => g.agenciaIds.includes(f.agenciaId));
+    let total = 0;
+    filas.forEach(f => {
+      const segmentosTienda = segmentosPorTienda.get(f.tiendaId) || [f];
+      const { totalIncidencias } = rmeCeldasDeTramoPdf(f, segmentosTienda, puntualAgenciaPorTienda.get(f.tiendaId), celdas[f.tiendaId] || {}, diasEnviados, totalDias, 1, 1, totalDias, anio, mesIndex);
+      total += totalIncidencias;
+    });
+    g.totalFilas = filas.length;
+    g.sinIncidencias = total === 0;
+  });
+}
+
+function rmeHtmlFilaGrupo(g, mesTerminado) {
+  const subAgencias = g.agenciasNombres.length > 1 ? g.agenciasNombres.join(' + ') : null;
+  const sinEmails = !g.emails.length;
+  const clave = escapeHtml(g.clave);
+
+  let estadoHtml;
+  if (!mesTerminado) {
+    estadoHtml = g.envio && !g.envio.omitido
+      ? `<span class="rme-badge-enviado">✅ Enviado</span>`
+      : `<button type="button" class="btn rme-btn-enviar" disabled title="Podrás enviarlo cuando termine el mes">Enviar PDF</button>`;
+  } else if (g.envio && g.envio.omitido) {
+    // Marcada a mano "No enviar este mes": no se mandó ningún correo.
+    const quien = g.envio.enviado_por ? ` por ${escapeHtml(g.envio.enviado_por)}` : '';
+    estadoHtml = `
+      <span class="rme-badge-gris" title="Marcada como no enviar${quien}">⏭️ Omitido</span>
+      <button type="button" class="icono-accion rme-btn-enviar" data-rme-deshacer="${clave}" title="Deshacer: volver a dejarla pendiente">↩</button>`;
+  } else if (g.envio) {
+    const fecha = new Date(g.envio.enviado_en).toLocaleDateString('es-ES', { day: '2-digit', month: '2-digit', year: 'numeric' });
+    estadoHtml = `
+      <span class="rme-badge-enviado" title="${g.envio.enviado_por ? 'Enviado por ' + escapeHtml(g.envio.enviado_por) : ''}">✅ ${fecha}</span>
+      <button type="button" class="icono-accion rme-btn-enviar" data-rme-enviar="${clave}" title="Reenviar">↻</button>`;
+  } else if (g.sinIncidencias) {
+    // Sin incidencias en todo el mes: no cuenta como pendiente. Si tiene
+    // tiendas, se puede enviar igualmente (el PDF saldría todo en OK).
+    estadoHtml = g.totalFilas
+      ? `<span class="rme-badge-gris" title="Ninguna incidencia este mes: no cuenta como pendiente">Sin incidencias</span>
+         <button type="button" class="icono-accion rme-btn-enviar" data-rme-enviar="${clave}" title="Enviar el PDF igualmente" ${sinEmails ? 'disabled' : ''}>📤</button>`
+      : `<span class="rme-badge-gris" title="No ha tenido tiendas asignadas este mes">Sin tiendas este mes</span>`;
+  } else {
+    estadoHtml = `
+      <button type="button" class="icono-accion rme-btn-enviar" data-rme-omitir="${clave}" title="No enviar este mes">⏭️</button>
+      <button type="button" class="btn primary rme-btn-enviar" data-rme-enviar="${clave}" ${sinEmails ? 'disabled' : ''}>Enviar PDF</button>`;
+  }
+
+  return `
+    <div class="rme-grupo-row" data-rme-fila="${escapeHtml(g.clave)}">
+      <div class="rme-grupo-info">
+        <b>${escapeHtml(g.nombre)}</b>${g.todasDeBaja ? ' <span class="rme-sub" style="display:inline;">(de baja)</span>' : ''}
+        ${subAgencias ? `<span class="rme-sub">Incluye: ${escapeHtml(subAgencias)}</span>` : ''}
+        ${sinEmails
+          ? `<span class="rme-sub rme-warn">Sin emails configurados</span>`
+          : `<span class="rme-sub">${g.emails.length} destinatario${g.emails.length === 1 ? '' : 's'}</span>`}
+      </div>
+      <div class="rme-grupo-estado">${estadoHtml}</div>
+    </div>`;
+}
+
+// ---------------------------------------------------------------
+// Envío: datos del mes (una sola vez, reutilizados tanto si se envía a
+// una agencia como si se envía a todas) + generación/subida/correo de un
+// grupo concreto.
+// ---------------------------------------------------------------
+async function rmeObtenerDatosMes() {
+  const datos = await rmCargarDatosMes(rmAnio, rmMes);
+  const todasLasFilas = rmConstruirTodasLasFilas(datos.cambiosPorTienda, datos.puntualAgenciaPorTienda, datos.totalDias);
+  return { ...datos, todasLasFilas };
+}
+
+// Genera el PDF de un grupo, lo sube, envía el correo y registra el envío.
+// Lanza un Error legible si algo falla. No pide confirmación (la pide
+// quien llama, una vez para uno o para todos).
+async function rmeProcesarEnvioGrupo(grupo, datosMes) {
+  const { celdas, diasEnviados, totalDias, todasLasFilas, puntualAgenciaPorTienda } = datosMes;
+  const segmentosPorTienda = rmSegmentosPorTienda(todasLasFilas);
+  const mesTexto = rmeTituloMes(rmAnio, rmMes);
+
+  const filasGrupo = todasLasFilas
+    .filter(f => grupo.agenciaIds.includes(f.agenciaId))
+    .sort((a, b) => a.agenciaNombre.localeCompare(b.agenciaNombre) || a.tiendaNombre.localeCompare(b.tiendaNombre) || a.diaInicio - b.diaInicio);
+
+  if (!filasGrupo.length) throw new Error('Esta agencia no tiene tiendas asignadas este mes.');
+
+  const doc = rmeConstruirPdf(grupo.nombre, rmAnio, rmMes, filasGrupo, segmentosPorTienda, puntualAgenciaPorTienda, celdas, diasEnviados, totalDias);
+  const nombreArchivo = rmeNombreArchivo(grupo.nombre, rmAnio, rmMes);
+  const blob = doc.output('blob');
+
+  const subject = `RESUMEN INCIDENCIAS ${grupo.nombre.toUpperCase()} ${mesTexto.toUpperCase()}`;
+  const html = plantillaHtmlResumenMensual(rmeMesAnioTexto(rmMes, rmAnio));
+  // El PDF se manda pegado al propio correo (base64), sin subirlo a
+  // Storage: no hay dónde verlo desde la app y solo ocuparía espacio.
+  await enviarEmail({
+    to: grupo.emails,
+    subject,
+    html,
+    attachments: [{ filename: nombreArchivo, content: blob, contentType: 'application/pdf' }]
+  });
+
+  const { error: eDb } = await sb.from('informes_mensuales_agencia_enviados').upsert({
+    grupo: grupo.clave,
+    anio: rmAnio,
+    mes: rmMes + 1,
+    pdf_nombre: nombreArchivo,
+    omitido: false,
+    enviado_en: new Date().toISOString(),
+    enviado_por: sesionActual?.nombre || sesionActual?.usuario || null
+  }, { onConflict: 'grupo,anio,mes' });
+  if (eDb) console.error('El correo se envió, pero no se pudo guardar el estado de envío:', eDb);
+  if (typeof registrarAccion === 'function') registrarAccion('reportes_mensuales', 'Enviar resumen mensual a agencia', `${grupo.nombre} — ${mesTexto}`);
+}
+
+// Envío de una sola agencia/grupo, desde su botón "Enviar PDF"/"Reenviar".
+async function rmeEnviarGrupo(clave, grupos, cont) {
+  if (rmeEnviando) return;
+  const grupo = grupos.find(g => g.clave === clave);
+  if (!grupo) return;
+
+  if (!rmeMesHaTerminado(rmAnio, rmMes)) {
+    await modalAlert('Todavía no puedes enviar el resumen del mes en curso: espera a que termine.', { titulo: 'Mes sin terminar' });
+    return;
+  }
+  if (!grupo.emails.length) {
+    await modalAlert('Esta agencia (o grupo) no tiene emails configurados. Añádelos en Gestión → Agencias.', { titulo: 'Sin destinatarios' });
+    return;
+  }
+  if (!pdfDisponible()) {
+    await modalAlert('No se pudo cargar el generador de PDF. Revisa tu conexión e inténtalo de nuevo.', { titulo: 'PDF no disponible' });
+    return;
+  }
+
+  const mesTexto = rmeTituloMes(rmAnio, rmMes);
+  const ok = await modalConfirm(
+    `Se generará el PDF del resumen de ${mesTexto} para "${grupo.nombre}" y se enviará a: ${grupo.emails.join(', ')}.`,
+    { titulo: '📤 Enviar resumen mensual', textoOk: 'Enviar' }
+  );
+  if (!ok) return;
+
+  rmeEnviando = true;
+  const filaEl = cont.querySelector(`[data-rme-fila="${CSS.escape(clave)}"] .rme-grupo-estado`);
+  if (filaEl) filaEl.innerHTML = '<span class="rme-sub">Generando y enviando…</span>';
+  mostrarCargandoEnvio(`Generando el PDF de ${grupo.nombre}…`);
+
+  try {
+    const datosMes = await rmeObtenerDatosMes();
+    actualizarCargandoEnvio(`Enviando correo a ${grupo.nombre}, espera…`);
+    await rmeProcesarEnvioGrupo(grupo, datosMes);
+    ocultarCargandoEnvio();
+    await modalAlert(`Correo enviado correctamente a: ${grupo.emails.join(', ')}`, { titulo: '✅ Resumen mensual enviado' });
+  } catch (err) {
+    console.error(`Error enviando el resumen mensual de ${grupo.nombre}:`, err);
+    ocultarCargandoEnvio();
+    await modalAlert(err.message || 'No se pudo enviar el resumen mensual.', { titulo: 'Error al enviar' });
+  } finally {
+    rmeEnviando = false;
+    await rmeCargarYRenderPanel();
+  }
+}
+
+// "No enviar este mes": deja registrado el grupo como omitido (sin mandar
+// ningún correo) para que deje de salir como pendiente, también en la
+// tarea de Inicio. Se puede deshacer desde la misma fila.
+async function rmeOmitirGrupo(clave, grupos) {
+  if (rmeEnviando) return;
+  const grupo = grupos.find(g => g.clave === clave);
+  if (!grupo) return;
+  const mesTexto = rmeTituloMes(rmAnio, rmMes);
+  const ok = await modalConfirm(
+    `"${grupo.nombre}" dejará de salir como pendiente para ${mesTexto} y no se le enviará ningún correo. Podrás deshacerlo después.`,
+    { titulo: '⏭️ No enviar este mes', textoOk: 'No enviar' }
+  );
+  if (!ok) return;
+
+  const { error } = await sb.from('informes_mensuales_agencia_enviados').upsert({
+    grupo: grupo.clave,
+    anio: rmAnio,
+    mes: rmMes + 1,
+    pdf_nombre: null,
+    omitido: true,
+    enviado_en: new Date().toISOString(),
+    enviado_por: sesionActual?.nombre || sesionActual?.usuario || null
+  }, { onConflict: 'grupo,anio,mes' });
+  if (error) {
+    console.error('No se pudo marcar como no enviar:', error);
+    await modalAlert('No se pudo guardar. Inténtalo de nuevo.', { titulo: 'Error' });
+    return;
+  }
+  if (typeof registrarAccion === 'function') registrarAccion('reportes_mensuales', 'Omitir resumen mensual a agencia', `${grupo.nombre} — ${mesTexto}`);
+  await rmeCargarYRenderPanel();
+}
+
+// Deshace un "No enviar este mes": borra el registro y la agencia vuelve
+// a quedar pendiente (o "Sin incidencias", si es el caso).
+async function rmeDeshacerOmitido(clave, grupos) {
+  if (rmeEnviando) return;
+  const grupo = grupos.find(g => g.clave === clave);
+  if (!grupo || !grupo.envio || !grupo.envio.omitido) return;
+
+  const { error } = await sb.from('informes_mensuales_agencia_enviados').delete()
+    .eq('grupo', grupo.clave).eq('anio', rmAnio).eq('mes', rmMes + 1).eq('omitido', true);
+  if (error) {
+    console.error('No se pudo deshacer el omitido:', error);
+    await modalAlert('No se pudo deshacer. Inténtalo de nuevo.', { titulo: 'Error' });
+    return;
+  }
+  if (typeof registrarAccion === 'function') registrarAccion('reportes_mensuales', 'Deshacer omitir resumen mensual', `${grupo.nombre} — ${rmeTituloMes(rmAnio, rmMes)}`);
+  await rmeCargarYRenderPanel();
+}
+
+// Envío masivo: todas las agencias/grupos que todavía no tengan el
+// resumen de este mes registrado como enviado.
+async function rmeEnviarTodosPendientes(grupos) {
+  if (rmeEnviando) return;
+
+  if (!rmeMesHaTerminado(rmAnio, rmMes)) {
+    await modalAlert('Todavía no puedes enviar el resumen del mes en curso: espera a que termine.', { titulo: 'Mes sin terminar' });
+    return;
+  }
+  const pendientes = grupos.filter(rmeEstaPendiente);
+  if (!pendientes.length) {
+    await modalAlert('No queda ninguna agencia pendiente de enviar este mes.', { titulo: 'Nada pendiente' });
+    return;
+  }
+  const conEmails = pendientes.filter(g => g.emails.length);
+  const sinEmails = pendientes.filter(g => !g.emails.length);
+  if (!conEmails.length) {
+    await modalAlert('Las agencias pendientes no tienen emails configurados. Añádelos en Gestión → Agencias.', { titulo: 'Sin destinatarios' });
+    return;
+  }
+  if (!pdfDisponible()) {
+    await modalAlert('No se pudo cargar el generador de PDF. Revisa tu conexión e inténtalo de nuevo.', { titulo: 'PDF no disponible' });
+    return;
+  }
+
+  const mesTexto = rmeTituloMes(rmAnio, rmMes);
+  let mensaje = `Se generará y enviará el PDF del resumen de ${mesTexto} a ${conEmails.length} agencia${conEmails.length === 1 ? '' : 's'}: ${conEmails.map(g => g.nombre).join(', ')}.`;
+  if (sinEmails.length) mensaje += `\n\nSe omiten (sin emails configurados): ${sinEmails.map(g => g.nombre).join(', ')}.`;
+  const ok = await modalConfirm(mensaje, { titulo: '📤 Enviar a todas las pendientes', textoOk: `Enviar a ${conEmails.length}` });
+  if (!ok) return;
+
+  rmeEnviando = true;
+  rmeActualizarToolbar(grupos, false);
+  mostrarCargandoEnvio(`Preparando envío… (0/${conEmails.length})`);
+
+  const resultados = [];
+  try {
+    const datosMes = await rmeObtenerDatosMes();
+    let i = 0;
+    for (const grupo of conEmails) {
+      i++;
+      actualizarCargandoEnvio(`Enviando a ${grupo.nombre}… (${i}/${conEmails.length})`);
+      try {
+        await rmeProcesarEnvioGrupo(grupo, datosMes);
+        resultados.push({ nombre: grupo.nombre, ok: true });
+      } catch (err) {
+        console.error(`Error enviando el resumen mensual de ${grupo.nombre}:`, err);
+        resultados.push({ nombre: grupo.nombre, ok: false, error: err.message || 'Error desconocido' });
+      }
+    }
+  } finally {
+    ocultarCargandoEnvio();
+    rmeEnviando = false;
+    await rmeCargarYRenderPanel();
+  }
+
+  const exitosos = resultados.filter(r => r.ok);
+  const fallidos = resultados.filter(r => !r.ok);
+  let resumen = `Enviado correctamente a ${exitosos.length} de ${resultados.length} agencia${resultados.length === 1 ? '' : 's'}.`;
+  if (fallidos.length) resumen += `\n\nFallos:\n` + fallidos.map(f => `• ${f.nombre}: ${f.error}`).join('\n');
+  await modalAlert(resumen, { titulo: fallidos.length ? 'Envío con errores' : '✅ Resumen mensual enviado' });
+}
+
+// ---------------------------------------------------------------
+// Construcción del PDF (mismo formato que el Excel manual: título,
+// leyenda de códigos y tabla Agencia/Tienda/Provincia/días/Total).
+// ---------------------------------------------------------------
+// Rayas diagonales grises (45º) que llenan una casilla vacía de la
+// leyenda, recortadas a sus bordes; luego se repasa el borde negro.
+function rmeRayarCasilla(doc, x, y, w, h, escala) {
+  const paso = Math.max(2, 4 * escala);
+  doc.setDrawColor(150, 150, 150);
+  doc.setLineWidth(Math.max(0.15, 0.4 * escala));
+  for (let k = paso; k < w + h; k += paso) {
+    const x1 = Math.max(0, k - h), y1 = k - x1;
+    const x2 = Math.min(w, k), y2 = k - x2;
+    doc.line(x + x1, y + h - y1, x + x2, y + h - y2);
+  }
+  doc.setDrawColor(0, 0, 0);
+  doc.rect(x, y, w, h);
+}
+
+function rmeHexToRgb(hex) {
+  const h = (hex || '#FFFFFF').replace('#', '');
+  return [parseInt(h.substring(0, 2), 16), parseInt(h.substring(2, 4), 16), parseInt(h.substring(4, 6), 16)];
+}
+
+// Igual que rmCeldasDeTramo() de reportes-mensuales.js, pero devolviendo
+// celdas para jsPDF-autotable en lugar de HTML. diaDesde/diaHasta (por
+// defecto todo el mes) recortan qué columnas de días se generan, para
+// poder exportar solo un rango de días dentro del mes.
+// `textoTramo(prefijo, nombre, nDias)` (opcional) decide el texto de los
+// bloques "Antes:"/"Cambia a:" para que quepa en UNA sola línea y no
+// duplique el alto de la fila; sin él se usa el texto completo.
+function rmeCeldasDeTramoPdf(f, segmentosTienda, puntualPorDia, celdasTienda, diasEnviados, totalDias, escala, diaDesde, diaHasta, anio, mesIndex, textoTramo) {
+  diaDesde = diaDesde || 1;
+  diaHasta = diaHasta || totalDias;
+  const celdas = [];
+  let totalIncidencias = 0;
+  const estiloCambio = { fillColor: [230, 230, 230], textColor: [0, 0, 0], fontStyle: 'italic', fontSize: 6 * escala };
+  const textoBloque = (prefijo, nombre, nDias) =>
+    typeof textoTramo === 'function' ? textoTramo(prefijo, nombre, nDias) : `${prefijo} ${nombre}`;
+  const estiloNaPuntual = { fillColor: [255, 255, 255], textColor: [255, 255, 255] };
+
+  if (f.esPuntual) {
+    // Días propios de la fila puntual rellenos; cada hueco de días ajenos
+    // se agrupa en una sola celda en blanco.
+    let hueco = 0;
+    const cerrarHueco = () => { if (hueco) { celdas.push({ content: '', colSpan: hueco, styles: estiloNaPuntual }); hueco = 0; } };
+    for (let dia = diaDesde; dia <= diaHasta; dia++) {
+      // Fila de "Entrega de sábado": los días sin entrega, gris como un domingo
+      if (f.esSabado && (!f.diasPuntuales || !f.diasPuntuales.has(dia))) {
+        cerrarHueco();
+        celdas.push({ content: '', esDomingo: true, styles: { fillColor: [244, 245, 247] } });
+        continue;
+      }
+      if (!f.diasPuntuales || !f.diasPuntuales.has(dia)) { hueco++; continue; }
+      cerrarHueco();
+      if (!diasEnviados.has(dia)) {
+        if (rmEsDomingo(anio, mesIndex, dia)) { celdas.push({ content: '', esDomingo: true, styles: { fillColor: [244, 245, 247] } }); continue; }
+        celdas.push({ content: '', styles: {} }); continue;
+      }
+      const c = celdasTienda[dia];
+      if (!c) { celdas.push({ content: 'OK', styles: { textColor: [0, 0, 0] } }); continue; }
+      if (c.ocultoPorMotivo) { celdas.push({ content: '', styles: {} }); continue; } // filtro de Motivo (solo al exportar)
+      totalIncidencias++;
+      celdas.push({ content: c.codigo, styles: { fillColor: rmeHexToRgb(c.color), textColor: rmeHexToRgb(c.texto), fontStyle: 'bold' } });
+    }
+    cerrarHueco();
+    return { celdas, totalIncidencias };
+  }
+
+  segmentosTienda
+    .filter(s => !s.esPuntual && s.diaFin < f.diaInicio)
+    .forEach(s => {
+      const ini = Math.max(s.diaInicio, diaDesde);
+      const fin = Math.min(s.diaFin, diaHasta);
+      if (ini > fin) return;
+      celdas.push({ content: textoBloque('Antes:', s.agenciaNombre, fin - ini + 1), colSpan: fin - ini + 1, styles: estiloCambio });
+    });
+
+  // Días consecutivos de baja (sin incidencia registrada) → una sola celda
+  // gris: "BAJA" si ocupa 2 o más cuadraditos, "BAJ" (3 letras) si es un
+  // único día, igual que en la pantalla.
+  const estiloBaja = { fillColor: [225, 228, 232], textColor: [90, 100, 115], fontStyle: 'bold', fontSize: 5.5 * escala };
+  let diasBajaSeguidos = 0;
+  const cerrarBloqueBaja = () => {
+    if (!diasBajaSeguidos) return;
+    celdas.push({ content: diasBajaSeguidos >= 2 ? 'BAJA' : 'BAJ', colSpan: diasBajaSeguidos, styles: estiloBaja });
+    diasBajaSeguidos = 0;
+  };
+
+  for (let dia = Math.max(f.diaInicio, diaDesde); dia <= Math.min(f.diaFin, diaHasta); dia++) {
+    const pun = puntualPorDia && puntualPorDia[dia];
+    // Solo las 3 primeras letras (p.ej. SEYLOTRANS → SEY), igual que en la
+    // pantalla de Reportes mensuales; el nombre completo va en la fila
+    // "puntual" de esa agencia.
+    // Sábado de "Entrega de sábado": las 3 primeras letras de la agencia que entrega ese día (p.ej. SEY).
+    if (pun && pun.esSabado) { cerrarBloqueBaja(); celdas.push({ content: String(pun.agenciaNombre || '').trim().slice(0, 3).toUpperCase() || 'S', styles: estiloCambio }); continue; }
+    if (pun) { cerrarBloqueBaja(); celdas.push({ content: String(pun.agenciaNombre || '').trim().slice(0, 3).toUpperCase(), styles: estiloCambio }); continue; }
+    // Tienda de baja ese día: gris, sin OK y sin contar (salvo incidencia ya registrada).
+    if (rmDiaEnBaja(f.tiendaId, dia) && !(diasEnviados.has(dia) && celdasTienda[dia])) { diasBajaSeguidos++; continue; }
+    cerrarBloqueBaja();
+    // Tienda de sábado fuera del sábado: gris rayado como un domingo
+    // (salvo incidencia ya registrada).
+    if (typeof rmMotivoSinEntregaTienda === 'function'
+      && rmMotivoSinEntregaTienda(f.tiendaId, anio, mesIndex, dia)
+      && !(diasEnviados.has(dia) && celdasTienda[dia])) {
+      celdas.push({ content: '', esDomingo: true, styles: { fillColor: [244, 245, 247] } }); continue;
+    }
+    if (!diasEnviados.has(dia)) {
+      if (rmEsDomingo(anio, mesIndex, dia)) { celdas.push({ content: '', esDomingo: true, styles: { fillColor: [244, 245, 247] } }); continue; }
+      celdas.push({ content: '', styles: {} }); continue;
+    }
+    const c = celdasTienda[dia];
+    if (!c) {
+      // Día anterior al alta de la tienda: vacío, no "OK" (igual que en pantalla).
+      if (dia < rmPrimerDiaTienda(f.tiendaId)) { celdas.push({ content: '', styles: {} }); continue; }
+      celdas.push({ content: 'OK', styles: { textColor: [0, 0, 0] } }); continue;
+    }
+    if (c.ocultoPorMotivo) { celdas.push({ content: '', styles: {} }); continue; } // filtro de Motivo (solo al exportar)
+    totalIncidencias++;
+    celdas.push({ content: c.codigo, styles: { fillColor: rmeHexToRgb(c.color), textColor: rmeHexToRgb(c.texto), fontStyle: 'bold' } });
+  }
+  cerrarBloqueBaja();
+
+  segmentosTienda
+    .filter(s => !s.esPuntual && s.diaInicio > f.diaFin)
+    .forEach(s => {
+      const ini = Math.max(s.diaInicio, diaDesde);
+      const fin = Math.min(s.diaFin, diaHasta);
+      if (ini > fin) return;
+      celdas.push({ content: textoBloque('Cambia a:', s.agenciaNombre, fin - ini + 1), colSpan: fin - ini + 1, styles: estiloCambio });
+    });
+
+  return { celdas, totalIncidencias };
+}
+
+// Dibuja título, leyenda y tabla principal sobre un doc ya creado.
+// `escala` reduce proporcionalmente los tamaños de letra/relleno de todo
+// el contenido (título, leyenda y tabla), sin tocar los anchos de columna
+// (que siguen ocupando todo el ancho de la página): así, cuando hay
+// muchas tiendas, la página sigue siendo la misma hoja A4 apaisada de
+// siempre —nunca más alta que ancha— y lo que se reduce es la letra,
+// igual que hace Excel al "ajustar la hoja a una página".
+// Devuelve el finalY de la tabla principal, es decir, dónde termina
+// realmente el contenido en esa página.
+function rmeDibujarContenidoPdf(doc, grupoNombre, anio, mesIndex, filasGrupo, segmentosPorTienda, puntualAgenciaPorTienda, celdas, diasEnviados, totalDias, escala, diaDesde, diaHasta) {
+  diaDesde = diaDesde || 1;
+  diaHasta = diaHasta || totalDias;
+  const esMesCompleto = diaDesde === 1 && diaHasta === totalDias;
+  const margen = 20;
+  const anchoPagina = doc.internal.pageSize.getWidth();
+  const anchoUtil = anchoPagina - margen * 2;
+
+  // --- Título (izquierda) y leyenda de códigos (derecha), lado a lado ---
+  // La leyenda se dibuja primero para saber su altura real, y así el
+  // recuadro del título se estira para ocupar esa misma altura (como en
+  // el informe manual), en vez de quedar un recuadro pequeño con un
+  // hueco vacío debajo hasta que empieza la tabla principal.
+  const anchoTitulo = Math.round(anchoUtil * 0.32);
+  const separacion = 10;
+  const anchoLeyenda = anchoUtil - anchoTitulo - separacion;
+
+  // Leyenda en 3 columnas de código+descripción (como en el informe
+  // manual), no 2: así queda más ancha y menos alta, y el recuadro del
+  // título (que se estira a su misma altura) no sale desproporcionado.
+  const tercio = Math.ceil(CODIGOS_INFORME.length / 3);
+  const filasLeyenda = [];
+  for (let i = 0; i < tercio; i++) {
+    const fila = [];
+    for (let col = 0; col < 3; col++) {
+      const c = CODIGOS_INFORME[i + col * tercio];
+      fila.push(
+        // Casillas sin código (cuando los códigos no llenan la última
+        // columna): van rayadas, para que se vea que están vacías.
+        c ? { content: c.codigo, styles: { fillColor: rmeHexToRgb(c.color), textColor: rmeHexToRgb(c.texto), fontStyle: 'bold', halign: 'center' } } : { content: '', rayado: true },
+        c ? { content: c.label, styles: { halign: 'left' } } : { content: '', rayado: true }
+      );
+    }
+    filasLeyenda.push(fila);
+  }
+  const anchoCodigo = 20;
+  const anchoLabel = anchoLeyenda / 3 - anchoCodigo;
+  doc.autoTable({
+    startY: margen,
+    margin: { left: margen + anchoTitulo + separacion, right: margen, bottom: margen },
+    tableWidth: anchoLeyenda,
+    theme: 'grid',
+    styles: { font: 'helvetica', fontSize: 6.5 * escala, textColor: [0, 0, 0], lineColor: [0, 0, 0], lineWidth: Math.max(0.15, 0.4 * escala), cellPadding: 2 * escala, valign: 'middle' },
+    head: [[{ content: 'LEYENDA', colSpan: 6, styles: { fillColor: [0, 0, 0], textColor: [255, 255, 255], halign: 'center', fontStyle: 'bold' } }]],
+    columnStyles: {
+      0: { cellWidth: anchoCodigo }, 1: { cellWidth: anchoLabel },
+      2: { cellWidth: anchoCodigo }, 3: { cellWidth: anchoLabel },
+      4: { cellWidth: anchoCodigo }, 5: { cellWidth: anchoLabel }
+    },
+    body: filasLeyenda,
+    didDrawCell: (d) => {
+      if (d.section === 'body' && d.cell.raw && d.cell.raw.rayado) {
+        rmeRayarCasilla(doc, d.cell.x, d.cell.y, d.cell.width, d.cell.height, escala);
+      }
+    }
+  });
+  const finalYLeyenda = doc.lastAutoTable.finalY;
+  const altoLeyenda = finalYLeyenda - margen;
+
+  doc.autoTable({
+    startY: margen,
+    margin: { left: margen, right: margen + anchoLeyenda + separacion, bottom: margen },
+    tableWidth: anchoTitulo,
+    theme: 'grid',
+    styles: { font: 'helvetica', fontSize: 17 * escala, fontStyle: 'bold', textColor: [0, 0, 0], lineColor: [0, 0, 0], lineWidth: Math.max(0.15, 0.75 * escala), cellPadding: 8 * escala, halign: 'center', valign: 'middle', fillColor: [255, 242, 204], minCellHeight: altoLeyenda },
+    body: [[`ENTREGAS MERCANCIA\n${grupoNombre.toUpperCase()}\n${esMesCompleto ? rmeTituloMes(anio, mesIndex) : `${diaDesde}-${diaHasta} ${rmeTituloMes(anio, mesIndex)}`}`]]
+  });
+  const finalYTitulo = doc.lastAutoTable.finalY;
+
+  // --- Tabla principal ---
+  const cabeceraDias = Array.from({ length: diaHasta - diaDesde + 1 }, (_, i) => String(diaDesde + i));
+  const cabecera = ['AGENCIA', 'TIENDA', 'PROVINCIA', ...cabeceraDias, 'TOTAL'];
+  // Índice de la columna TOTAL (la última): cambia según cuántos días
+  // tenga el rango, por eso se calcula en vez de ser fijo.
+  const idxColTotal = 3 + cabeceraDias.length;
+
+  // Ancho de columna fijo e IGUAL para todas las columnas de día: si se
+  // deja en automático, jsPDF-autoTable calcula cada columna según lo más
+  // ancho que haya escrito en ella (como el autoajuste de Excel), y dos
+  // columnas de día pueden salir con un ancho ligeramente distinto según
+  // lleven "OK", un código de 1 carácter o de 2. Al fijarlo aquí, todos
+  // los "cuadraditos" de día salen exactamente del mismo ancho siempre
+  // (ese ancho sí cambia de un informe a otro según cuántos días tenga
+  // el rango exportado: un mes de 31 días los deja algo más estrechos
+  // que uno de 28).
+  const anchoColAgencia = 55, anchoColTienda = 90, anchoColProvincia = 92, anchoColTotal = 32;
+  const anchoFijoResto = anchoColAgencia + anchoColTienda + anchoColProvincia + anchoColTotal;
+  const anchoColDia = (anchoUtil - anchoFijoResto) / cabeceraDias.length;
+  // Texto de los bloques "Antes:"/"Cambia a:" en UNA sola línea: si el
+  // tramo es ancho, "Cambia a: SEYLOTRANS"; si no cabe, solo el nombre de
+  // la agencia; y si tampoco, sus 3 primeras letras (como los sábados).
+  // Así la fila de la tienda no se hace el doble de alta que las demás.
+  const textoTramoUnaLinea = (prefijo, nombre, nDias) => {
+    const nombreAg = String(nombre || '').trim();
+    const anchoDisponible = anchoColDia * nDias - 4 * escala; // menos el relleno de la celda
+    doc.setFont('helvetica', 'italic');
+    doc.setFontSize(6 * escala);
+    const cabe = (t) => doc.getTextWidth(t) <= anchoDisponible;
+    const completo = `${prefijo} ${nombreAg}`;
+    if (cabe(completo)) return completo;
+    if (cabe(nombreAg)) return nombreAg;
+    return nombreAg.slice(0, 3).toUpperCase();
+  };
+  const columnStylesDias = {};
+  cabeceraDias.forEach((_, i) => { columnStylesDias[3 + i] = { cellWidth: anchoColDia }; });
+
+  const cuerpo = filasGrupo.map(f => {
+    const celdasTienda = celdas[f.tiendaId] || {};
+    const segmentosTienda = segmentosPorTienda.get(f.tiendaId) || [f];
+    const puntualPorDia = puntualAgenciaPorTienda.get(f.tiendaId);
+    const { celdas: celdasDias, totalIncidencias } = rmeCeldasDeTramoPdf(f, segmentosTienda, puntualPorDia, celdasTienda, diasEnviados, totalDias, escala, diaDesde, diaHasta, anio, mesIndex, textoTramoUnaLinea);
+    // Tiendas de sábado: redondel amarillo con "S" a la izquierda del
+    // nombre de la agencia (se dibuja en didDrawCell; aquí solo se deja
+    // hueco a la izquierda para que no se monte sobre el texto).
+    const esSabado = typeof rmFilaEsDeSabado === 'function' && rmFilaEsDeSabado(f);
+    const celdaAgencia = { content: f.agenciaNombre + (f.esPuntual && !f.esSabado ? ' (puntual)' : ''), styles: { halign: 'center', fontStyle: 'bold' } };
+    if (esSabado) {
+      celdaAgencia.esSabado = true;
+      celdaAgencia.styles.cellPadding = { top: 2 * escala, bottom: 2 * escala, right: 1.5 * escala, left: 8.5 * escala };
+    }
+    return [
+      celdaAgencia,
+      { content: f.tiendaNombre, styles: { halign: 'center' } },
+      { content: f.tiendaProvincia || '—', styles: { halign: 'center' } },
+      ...celdasDias,
+      { content: String(totalIncidencias), styles: { fontStyle: 'bold', fillColor: [240, 240, 240] } }
+    ];
+  });
+
+  doc.autoTable({
+    startY: Math.max(finalYTitulo, finalYLeyenda) + 8 * escala,
+    margin: { left: margen, right: margen, bottom: margen },
+    tableWidth: anchoUtil,
+    theme: 'grid',
+    styles: { font: 'helvetica', fontSize: 6.5 * escala, textColor: [0, 0, 0], lineColor: [0, 0, 0], lineWidth: Math.max(0.15, 0.35 * escala), cellPadding: 2 * escala, halign: 'center', valign: 'middle', overflow: 'linebreak' },
+    head: [cabecera],
+    headStyles: { fillColor: [0, 0, 0], textColor: [255, 255, 255], fontStyle: 'bold', halign: 'center', fontSize: 6.5 * escala },
+    columnStyles: {
+      0: { cellWidth: anchoColAgencia, halign: 'center', fontStyle: 'bold' },
+      1: { cellWidth: anchoColTienda, halign: 'center' },
+      // Ancho suficiente para que provincias largas como "VIANA DO
+      // CASTELO" entren en una sola línea y no dupliquen el alto de la fila.
+      2: { cellWidth: anchoColProvincia, halign: 'center' },
+      ...columnStylesDias,
+      [idxColTotal]: { cellWidth: anchoColTotal }
+    },
+    body: cuerpo,
+    // Domingo sin entrega habitual: además del relleno gris (fillColor,
+    // puesto ya en rmeCeldasDeTramoPdf), se raya en diagonal la celda
+    // marcada con esDomingo (recortado al propio rectángulo de la celda),
+    // para que se distinga a simple vista de un informe realmente
+    // pendiente entre semana (celda blanca vacía).
+    didDrawCell(data) {
+      if (data.section === 'body' && data.cell.raw && data.cell.raw.esSabado) {
+        // Hueco justo para que "SEYLOTRANS" siga cabiendo en una línea
+        // en la columna AGENCIA (55 pt).
+        const r = 2.6 * escala;
+        const cx = data.cell.x + 1.2 * escala + r;
+        const cy = data.cell.y + data.cell.height / 2;
+        doc.saveGraphicsState();
+        doc.setFillColor(252, 229, 136);
+        doc.circle(cx, cy, r, 'F');
+        doc.setTextColor(122, 91, 0);
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(4.2 * escala);
+        doc.text('S', cx, cy, { align: 'center', baseline: 'middle' });
+        doc.restoreGraphicsState();
+        return;
+      }
+      if (data.section !== 'body' || !data.cell.raw || !data.cell.raw.esDomingo) return;
+      const { x, y, width: w, height: h } = data.cell;
+      doc.saveGraphicsState();
+      doc.rect(x, y, w, h, null);
+      doc.clip();
+      doc.discardPath();
+      doc.setDrawColor(190, 190, 190);
+      doc.setLineWidth(Math.max(0.15, 0.35 * escala));
+      const paso = 4 * escala;
+      for (let off = -h; off < w; off += paso) {
+        doc.line(x + off, y + h, x + off + h, y);
+      }
+      doc.restoreGraphicsState();
+    }
+  });
+
+  return doc.lastAutoTable.finalY;
+}
+
+// El PDF siempre es una página A4 apaisada REAL (841.89 x 595.28pt, más
+// ancha que alta: por eso sale siempre en horizontal al imprimir, nunca
+// "en vertical"). Como con muchas tiendas la tabla no cabe a tamaño
+// normal en esa altura, se mide primero cuánto ocuparía a tamaño normal
+// en una página de prueba bien alta y, si no cabe, se vuelve a dibujar
+// todo (título, leyenda y tabla) más pequeño —una única escala para
+// todo—, igual que Excel al "ajustar la hoja a una página": se reduce la
+// letra, no la página. Con pocas tiendas (la mayoría de los casos) no
+// hace falta reducir nada.
+function rmeCrearDocMedida(ancho, alto) {
+  const { jsPDF } = window.jspdf;
+  // Página de prueba, descartada al final: se crea con un tamaño de
+  // partida cualquiera y se fija el ancho/alto reales directamente sobre
+  // el documento, porque si se pasaran como formato [ancho, alto], jsPDF
+  // los intercambiaría en cuanto el alto de prueba (bien alto a
+  // propósito) supere al ancho, dejando la medida mal hecha.
+  const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' });
+  doc.internal.pageSize.width = ancho;
+  doc.internal.pageSize.height = alto;
+  return doc;
+}
+
+// Máximo de filas (tiendas) de la tabla principal por página. Si el
+// listado tiene más, se reparte en tantas páginas como haga falta, cada
+// una con el título, la leyenda y la cabecera de columnas repetidos, y
+// con el pie "Página X de Y" abajo del todo.
+const RME_FILAS_POR_PAGINA = 40;
+
+function rmeConstruirPdf(grupoNombre, anio, mesIndex, filasGrupo, segmentosPorTienda, puntualAgenciaPorTienda, celdas, diasEnviados, totalDias, diaDesde, diaHasta) {
+  const margen = 20;
+  const anchoPagina = 841.89; // A4 apaisado real, en pt
+  const altoPagina = 595.28;
+  const altoPie = 18; // hueco reservado abajo del todo para "Página X de Y"
+
+  // Repartimos las filas en bloques de como máximo RME_FILAS_POR_PAGINA:
+  // cada bloque es una página completa (con título, leyenda y cabecera
+  // de columnas propios). Si no hay filas, dejamos un único bloque vacío
+  // para no perder el título/leyenda (aunque en la práctica nunca se
+  // llega aquí sin filas, ver comprobaciones antes de llamar a esta función).
+  const bloques = [];
+  for (let i = 0; i < filasGrupo.length; i += RME_FILAS_POR_PAGINA) {
+    bloques.push(filasGrupo.slice(i, i + RME_FILAS_POR_PAGINA));
+  }
+  if (!bloques.length) bloques.push([]);
+
+  // Pasada de medida a tamaño normal (escala 1), con el bloque más
+  // grande (como mucho RME_FILAS_POR_PAGINA filas) en una página de
+  // prueba bien alta para que nunca pagine por quedarse corta. Al medir
+  // como mucho una página llena (y no el listado entero), la escala sale
+  // igual de homogénea tenga el informe 5 filas o 500.
+  const filasBloqueMasGrande = bloques.reduce((max, b) => Math.max(max, b.length), 0) || 1;
+  const alturaEstimada = 260 + filasBloqueMasGrande * 22 + 200;
+  const docMedida = rmeCrearDocMedida(anchoPagina, alturaEstimada);
+  const bloqueParaMedir = bloques.reduce((mayor, b) => (b.length > mayor.length ? b : mayor), bloques[0]);
+  const finalYMedido = rmeDibujarContenidoPdf(docMedida, grupoNombre, anio, mesIndex, bloqueParaMedir, segmentosPorTienda, puntualAgenciaPorTienda, celdas, diasEnviados, totalDias, 1, diaDesde, diaHasta);
+
+  // Si el contenido de una página llena a tamaño normal no cabe en el
+  // alto real de una A4 (contando el hueco del pie de página), se
+  // calcula la escala que hace falta para que sí quepa (con un pequeño
+  // margen de seguridad); si cabe de sobra, se deja a tamaño normal. La
+  // misma escala se usa en todas las páginas del documento.
+  const alturaNecesaria = finalYMedido - margen;
+  const alturaDisponible = (altoPagina - margen * 2 - altoPie) * 0.985;
+  const escala = alturaNecesaria > alturaDisponible ? alturaDisponible / alturaNecesaria : 1;
+
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'a4' });
+  bloques.forEach((filasPagina, idx) => {
+    if (idx > 0) doc.addPage();
+    rmeDibujarContenidoPdf(doc, grupoNombre, anio, mesIndex, filasPagina, segmentosPorTienda, puntualAgenciaPorTienda, celdas, diasEnviados, totalDias, escala, diaDesde, diaHasta);
+  });
+
+  rmeAnadirPiePagina(doc, margen);
+
+  return doc;
+}
+
+// Añade, abajo del todo en cada página ya dibujada, el mismo pie de tres
+// columnas que el PDF del Ranking de incidencias: marca a la izquierda,
+// "Página X de Y" centrado, y la fecha/hora de generación a la derecha.
+// Se hace al final (con el documento ya completo) para poder saber el
+// total de páginas de una vez.
+function rmeAnadirPiePagina(doc, margen) {
+  const totalPaginas = doc.internal.getNumberOfPages();
+  const anchoPagina = doc.internal.pageSize.getWidth();
+  const altoPagina = doc.internal.pageSize.getHeight();
+  const generadoTexto = `Generado el ${formatearFechaHoraCorta(new Date())}`;
+  for (let pagina = 1; pagina <= totalPaginas; pagina++) {
+    doc.setPage(pagina);
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(7.5);
+    doc.setTextColor(91, 101, 114);
+    doc.text('GIDT · Reportes mensuales', margen, altoPagina - margen / 2 - 2);
+    doc.text(`Página ${pagina} de ${totalPaginas}`, anchoPagina / 2, altoPagina - margen / 2 - 2, { align: 'center' });
+    doc.text(generadoTexto, anchoPagina - margen, altoPagina - margen / 2 - 2, { align: 'right' });
+  }
+}
+
+// ---------------------------------------------------------------
+// Tarea pendiente en Inicio: avisa cuando un mes ya terminado se queda
+// sin enviar a alguna agencia, hasta que se envíe. RME_MES_INICIO marca
+// el primer mes que cubre esta función: antes de esa fecha no había
+// seguimiento de estos envíos (se hacían a mano), así que no tiene
+// sentido -ni sería correcto- avisar de meses anteriores sin datos.
+// ---------------------------------------------------------------
+const RME_MES_INICIO = { anio: 2026, mes: 8 }; // Septiembre de 2026 (mes 0-indexado)
+
+async function rmeComprobarPendienteInicio() {
+  const hoy = new Date();
+  let anio = hoy.getFullYear();
+  let mes = hoy.getMonth() - 1; // último mes ya terminado
+  if (mes < 0) { mes = 11; anio -= 1; }
+
+  if (anio < RME_MES_INICIO.anio || (anio === RME_MES_INICIO.anio && mes < RME_MES_INICIO.mes)) {
+    return null;
+  }
+
+  try {
+    const [{ data: agencias, error: e1 }, { data: envios, error: e2 }] = await Promise.all([
+      sb.from('agencias').select('id, nombre, orden, emails, grupo_envio, activo'),
+      sb.from('informes_mensuales_agencia_enviados').select('grupo').eq('anio', anio).eq('mes', mes + 1)
+    ]);
+    if (e1) throw e1;
+    if (e2) throw e2;
+
+    const grupos = rmeConstruirGrupos(agencias || []);
+    if (!grupos.length) return null;
+    // Cuentan como hechos tanto los enviados como los marcados "No enviar
+    // este mes" (omitido): los dos tienen su fila en la tabla.
+    const enviados = new Set((envios || []).map(e => e.grupo));
+    let pendientes = grupos.filter(g => !enviados.has(g.clave));
+    if (!pendientes.length) return null;
+
+    // Las agencias sin ninguna incidencia en todo el mes tampoco cuentan
+    // como pendientes. Solo se calcula si queda alguna sin registro, para
+    // no cargar el mes entero cuando ya está todo enviado.
+    try {
+      const datos = await rmCargarDatosMes(anio, mes);
+      const todasLasFilas = rmConstruirTodasLasFilas(datos.cambiosPorTienda, datos.puntualAgenciaPorTienda, datos.totalDias);
+      await rmeMarcarSinIncidencias(pendientes, { ...datos, todasLasFilas }, anio, mes);
+      pendientes = pendientes.filter(g => !g.sinIncidencias);
+    } catch (err) {
+      console.error('No se pudo comprobar qué agencias no tienen incidencias este mes:', err);
+      // Sin poder calcularlo, al menos no se avisa de agencias de baja.
+      pendientes = pendientes.filter(g => !g.todasDeBaja);
+    }
+    if (!pendientes.length) return null;
+
+    return {
+      icono: '🗓️',
+      texto: `Informe mensual de ${rmeMesNombreCapitalizado(mes).toUpperCase()} pendiente de enviar a agencias (${pendientes.length})`,
+      vista: 'analisis-reportes-mensuales',
+      anio,
+      mes
+    };
+  } catch (err) {
+    console.error('Error comprobando el resumen mensual pendiente:', err);
+    return null;
+  }
+}
+
+rmeEngancharPanel();

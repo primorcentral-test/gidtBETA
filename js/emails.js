@@ -1,0 +1,342 @@
+  // Gestión de agencias
+  // ---------------------------------------------------------------
+  // Tiendas que dependen de cada agencia (como habitual, de sábado o de
+  // prueba). Solo cuentan las tiendas activas. Una agencia con alguna no
+  // se puede dar de baja: primero hay que reasignarlas.
+  async function contarTiendasPorAgencia() {
+    const { data, error } = await sb.from('tiendas')
+      .select('agencia_id, sabado_agencia_id, prueba_agencia_id')
+      .eq('activo', true);
+    if (error) throw error;
+    const cuenta = new Map();
+    const sumar = (id) => { if (id != null) cuenta.set(id, (cuenta.get(id) || 0) + 1); };
+    (data || []).forEach(t => {
+      // Una misma tienda cuenta una sola vez por agencia, aunque la tenga
+      // a la vez como habitual y de sábado.
+      new Set([t.agencia_id, t.sabado_agencia_id, t.prueba_agencia_id]).forEach(sumar);
+    });
+    return cuenta;
+  }
+
+  function htmlTarjetaAgencia(ag, numTiendas) {
+    const emails = ag.emails || [];
+    const textoTiendas = numTiendas ? `${numTiendas} tienda${numTiendas === 1 ? '' : 's'}` : 'Sin tiendas';
+    const tituloBaja = numTiendas
+      ? `Tiene ${textoTiendas} asignada${numTiendas === 1 ? '' : 's'}: reasígnala${numTiendas === 1 ? '' : 's'} antes de darla de baja`
+      : 'Dar de baja esta agencia';
+    return `
+        <div class="email-card" data-agencia-email="${ag.id}">
+          <div class="cabecera">
+            <div class="email-card-titulos">
+              <b>${escapeHtml(ag.nombre)}</b>
+              <div class="email-comercial-linea" data-comercial-linea>
+                ${ag.nombre_comercial
+                  ? `<span class="email-comercial-texto">Nombre comercial: ${escapeHtml(ag.nombre_comercial)}</span><button type="button" class="mini-btn" data-editar-comercial title="Editar nombre comercial">✏️</button>`
+                  : `<button type="button" class="email-comercial-anadir" data-editar-comercial>+ Añadir nombre comercial</button>`
+                }
+              </div>
+              <div class="email-comercial-linea" data-grupo-linea title="Junta esta agencia con otras bajo un mismo resumen mensual y un mismo envío (p.ej. varias divisiones de la misma empresa).">
+                ${ag.grupo_envio
+                  ? `<span class="email-comercial-texto">Grupo de envío: ${escapeHtml(ag.grupo_envio)}</span><button type="button" class="mini-btn" data-editar-grupo title="Editar grupo de envío">✏️</button>`
+                  : `<button type="button" class="email-comercial-anadir" data-editar-grupo>+ Agrupar con otra agencia (resumen mensual)</button>`
+                }
+              </div>
+            </div>
+            <div class="agencia-cabecera-acciones">
+              <span style="font-size:12px; color:var(--ink-soft); white-space:nowrap;">${emails.length} destinatario${emails.length===1?'':'s'} · ${textoTiendas}</span>
+              <button type="button" class="btn agencia-btn-baja${numTiendas ? ' atenuado' : ''}" data-dar-baja title="${tituloBaja}">🚫 Dar de baja</button>
+            </div>
+          </div>
+          <div class="email-chips">
+            ${emails.map(em => `
+              <span class="email-chip">${escapeHtml(em)}<button data-quitar="${escapeHtml(em)}">✕</button></span>
+            `).join('') || '<span style="font-size:12.5px; color:var(--ink-soft);">Sin emails configurados</span>'}
+          </div>
+          <div class="email-add-row">
+            <input type="email" class="form-input" placeholder="nuevo@email.com" data-input-email>
+            <button class="btn" data-anadir>Añadir</button>
+          </div>
+        </div>`;
+  }
+
+  function htmlTarjetaAgenciaBaja(ag) {
+    const desde = ag.baja_desde ? ` desde ${formatearFechaCorta(new Date(ag.baja_desde + 'T00:00:00'))}` : '';
+    return `
+        <div class="email-card agencia-de-baja" data-agencia-baja="${ag.id}">
+          <div class="cabecera" style="margin-bottom:0;">
+            <div class="email-card-titulos">
+              <b>${escapeHtml(ag.nombre)}</b><span class="agencia-badge-baja">De baja${desde}</span>
+              <div class="email-comercial-linea"><span class="email-comercial-texto">No aparece al asignar tiendas ni en el resumen mensual. Su historial se conserva.</span></div>
+            </div>
+            <button type="button" class="btn agencia-btn-baja" data-reactivar>↩ Reactivar</button>
+          </div>
+        </div>`;
+  }
+
+  // Con la ventana de carga global (js/carga-global.js).
+  async function cargarEmailsAgencias() {
+    return conCargaGlobal(() => cargarEmailsAgenciasSinCarga());
+  }
+
+  async function cargarEmailsAgenciasSinCarga() {
+    const cont = document.getElementById('listaEmailsAgencias');
+    cont.innerHTML = '<div class="card"><div class="empty"><p>Cargando…</p></div></div>';
+    try {
+      const [{ data, error }, tiendasPorAgencia] = await Promise.all([
+        sb.from('agencias').select('id, nombre, nombre_comercial, grupo_envio, emails, orden, activo, baja_desde').order('orden'),
+        contarTiendasPorAgencia()
+      ]);
+      if (error) throw error;
+
+      const activas = data.filter(ag => ag.activo !== false);
+      const deBaja = data.filter(ag => ag.activo === false);
+
+      cont.innerHTML = activas.map(ag => htmlTarjetaAgencia(ag, tiendasPorAgencia.get(ag.id) || 0)).join('')
+        + (deBaja.length ? `
+          <details class="agencias-baja-seccion">
+            <summary>🚫 Agencias de baja (${deBaja.length})</summary>
+            ${deBaja.map(htmlTarjetaAgenciaBaja).join('')}
+          </details>` : '');
+
+      cont.querySelectorAll('[data-agencia-email]').forEach(card => {
+        const agenciaId = Number(card.dataset.agenciaEmail);
+        const nombreAgencia = card.querySelector('b').textContent;
+
+        card.querySelector('[data-editar-comercial]').addEventListener('click', () => editarNombreComercialAgencia(agenciaId, nombreAgencia));
+        card.querySelector('[data-editar-grupo]').addEventListener('click', () => editarGrupoEnvioAgencia(agenciaId, nombreAgencia));
+        card.querySelector('[data-dar-baja]').addEventListener('click', () => darDeBajaAgencia(agenciaId, nombreAgencia));
+
+        card.querySelectorAll('[data-quitar]').forEach(btn => {
+          btn.addEventListener('click', () => actualizarEmailsAgencia(agenciaId, card, 'quitar', btn.dataset.quitar));
+        });
+
+        const input = card.querySelector('[data-input-email]');
+        const btnAdd = card.querySelector('[data-anadir]');
+        const anadir = () => {
+          const val = input.value.trim();
+          if (!val) return;
+          actualizarEmailsAgencia(agenciaId, card, 'anadir', val);
+        };
+        btnAdd.addEventListener('click', anadir);
+        input.addEventListener('keydown', e => { if (e.key === 'Enter') anadir(); });
+      });
+
+      cont.querySelectorAll('[data-agencia-baja]').forEach(card => {
+        const agenciaId = Number(card.dataset.agenciaBaja);
+        const nombreAgencia = card.querySelector('b').textContent;
+        card.querySelector('[data-reactivar]').addEventListener('click', () => reactivarAgencia(agenciaId, nombreAgencia));
+      });
+    } catch (err) {
+      console.error('Error cargando emails de agencias:', err);
+      cont.innerHTML = '<div class="card"><div class="empty"><p style="color:var(--grave);">Error al cargar.</p></div></div>';
+    }
+  }
+
+  // Tras dar de baja / reactivar: recarga esta lista y la caché de
+  // agencias (desplegables de tiendas, informe del día, filtros...).
+  async function refrescarTrasCambioEstadoAgencia() {
+    await cargarEmailsAgencias();
+    if (typeof cargarAgenciasYTiendas === 'function') await cargarAgenciasYTiendas();
+  }
+
+  async function darDeBajaAgencia(agenciaId, nombreAgencia) {
+    try {
+      // Se vuelve a comprobar en el momento (otro compañero podría haberle
+      // asignado una tienda desde que se cargó la lista).
+      const numTiendas = (await contarTiendasPorAgencia()).get(agenciaId) || 0;
+      if (numTiendas) {
+        await modalAlert(`${nombreAgencia} todavía tiene ${numTiendas} tienda${numTiendas === 1 ? '' : 's'} asignada${numTiendas === 1 ? '' : 's'} (como agencia habitual, de sábado o de prueba). Reasígnala${numTiendas === 1 ? '' : 's'} en Gestión → Tiendas antes de darla de baja.`, { titulo: 'No se puede dar de baja' });
+        await cargarEmailsAgencias();
+        return;
+      }
+      const ok = await modalConfirm(
+        `Dejará de aparecer al asignar tiendas, en el cambio puntual de agencia del Informe del día y en el envío del resumen mensual.\n\nLas incidencias, siniestros y reportes de meses anteriores la seguirán mostrando. Podrás reactivarla cuando quieras.`,
+        { titulo: `Dar de baja ${nombreAgencia}`, icono: '🚫', danger: true, textoOk: 'Dar de baja' }
+      );
+      if (!ok) return;
+
+      const { error } = await sb.from('agencias')
+        .update({ activo: false, baja_desde: fechaLocalISO(new Date()) })
+        .eq('id', agenciaId);
+      if (error) throw error;
+      if (typeof registrarAccion === 'function') registrarAccion('agencias', 'Dar de baja agencia', nombreAgencia);
+      await refrescarTrasCambioEstadoAgencia();
+    } catch (err) {
+      console.error('Error dando de baja la agencia:', err);
+      await modalAlert('No se pudo dar de baja la agencia. Inténtalo de nuevo.', { titulo: 'Error' });
+    }
+  }
+
+  async function reactivarAgencia(agenciaId, nombreAgencia) {
+    const ok = await modalConfirm(
+      `${nombreAgencia} volverá a aparecer al asignar tiendas, en el Informe del día y en el resumen mensual.`,
+      { titulo: `Reactivar ${nombreAgencia}`, icono: '↩', textoOk: 'Reactivar' }
+    );
+    if (!ok) return;
+    try {
+      const { error } = await sb.from('agencias').update({ activo: true, baja_desde: null }).eq('id', agenciaId);
+      if (error) throw error;
+      if (typeof registrarAccion === 'function') registrarAccion('agencias', 'Reactivar agencia', nombreAgencia);
+      await refrescarTrasCambioEstadoAgencia();
+    } catch (err) {
+      console.error('Error reactivando la agencia:', err);
+      await modalAlert('No se pudo reactivar la agencia. Inténtalo de nuevo.', { titulo: 'Error' });
+    }
+  }
+
+  async function editarNombreComercialAgencia(agenciaId, nombreAgencia) {
+    const { data } = await sb.from('agencias').select('nombre_comercial').eq('id', agenciaId).maybeSingle();
+    const valorActual = data?.nombre_comercial || '';
+
+    const nuevo = await modalPrompt('', {
+      titulo: `Nombre comercial para ${nombreAgencia}`,
+      placeholder: 'Ej: DHL PARCEL IBERIA, S.L.U',
+      valorInicial: valorActual
+    });
+    if (nuevo === null) return; // cancelado
+
+    try {
+      const { error } = await sb.from('agencias').update({ nombre_comercial: nuevo.trim() || null }).eq('id', agenciaId);
+      if (error) throw error;
+      cargarEmailsAgencias();
+    } catch (err) {
+      console.error('Error guardando nombre comercial:', err);
+      await modalAlert('No se pudo guardar el nombre comercial.', { titulo: 'Error' });
+    }
+  }
+
+  // Grupo de envío: junta varias agencias (p.ej. "CBL EXTERNO" y "CBL MLG")
+  // bajo un mismo PDF y un mismo correo al enviar el resumen mensual desde
+  // Análisis → Reportes mensuales (ver js/reportes-mensuales-envio.js).
+  async function editarGrupoEnvioAgencia(agenciaId, nombreAgencia) {
+    const { data } = await sb.from('agencias').select('grupo_envio').eq('id', agenciaId).maybeSingle();
+    const valorActual = data?.grupo_envio || '';
+
+    const nuevo = await modalPrompt(
+      'Las agencias que compartan el mismo grupo se enviarán juntas en un único PDF/correo al mandar el resumen mensual. Déjalo en blanco para que esta agencia se envíe sola.',
+      {
+        titulo: `Grupo de envío para ${nombreAgencia}`,
+        placeholder: 'Ej: CBL',
+        valorInicial: valorActual
+      }
+    );
+    if (nuevo === null) return; // cancelado
+
+    try {
+      const { error } = await sb.from('agencias').update({ grupo_envio: nuevo.trim() || null }).eq('id', agenciaId);
+      if (error) throw error;
+      cargarEmailsAgencias();
+    } catch (err) {
+      console.error('Error guardando el grupo de envío:', err);
+      await modalAlert('No se pudo guardar el grupo de envío.', { titulo: 'Error' });
+    }
+  }
+
+  async function actualizarEmailsAgencia(agenciaId, cardEl, accion, email) {
+    try {
+      const { data, error } = await sb.from('agencias').select('emails').eq('id', agenciaId).single();
+      if (error) throw error;
+
+      let emails = data.emails || [];
+      if (accion === 'anadir') {
+        if (!emails.includes(email)) emails = [...emails, email];
+      } else {
+        emails = emails.filter(e => e !== email);
+      }
+
+      const { error: e2 } = await sb.from('agencias').update({ emails }).eq('id', agenciaId);
+      if (e2) throw e2;
+
+      cargarEmailsAgencias();
+    } catch (err) {
+      console.error('Error actualizando emails:', err);
+      await modalAlert('No se pudo actualizar el email.', { titulo: 'Error' });
+    }
+  }
+
+  // ---------------- Nueva agencia ----------------
+
+  function parsearEmailsTexto(texto) {
+    return Array.from(new Set(
+      (texto || '')
+        .split(/[\n,;]+/)
+        .map(e => e.trim())
+        .filter(Boolean)
+    ));
+  }
+
+  function abrirModalNuevaAgencia() {
+    document.getElementById('naNombre').value = '';
+    document.getElementById('naNombreComercial').value = '';
+    document.getElementById('naGrupoEnvio').value = '';
+    document.getElementById('naEmails').value = '';
+    document.getElementById('naError').style.display = 'none';
+    document.getElementById('nuevaAgenciaModalOverlay').classList.add('show');
+    setTimeout(() => document.getElementById('naNombre').focus(), 30);
+  }
+
+  function cerrarModalNuevaAgencia() {
+    document.getElementById('nuevaAgenciaModalOverlay').classList.remove('show');
+  }
+
+  async function guardarNuevaAgencia() {
+    const nombre = document.getElementById('naNombre').value.trim();
+    const nombreComercial = document.getElementById('naNombreComercial').value.trim();
+    const grupoEnvio = document.getElementById('naGrupoEnvio').value.trim();
+    const emails = parsearEmailsTexto(document.getElementById('naEmails').value);
+    const errEl = document.getElementById('naError');
+    errEl.style.display = 'none';
+
+    if (!nombre) {
+      errEl.textContent = 'El nombre de la agencia es obligatorio.';
+      errEl.style.display = 'block';
+      return;
+    }
+
+    const btn = document.getElementById('btnGuardarNuevaAgencia');
+    btn.disabled = true;
+    try {
+      const { data: maxOrden } = await sb.from('agencias').select('orden').order('orden', { ascending: false }).limit(1).maybeSingle();
+      const siguienteOrden = (maxOrden?.orden || 0) + 1;
+
+      const { error } = await sb.from('agencias').insert({
+        nombre,
+        nombre_comercial: nombreComercial || null,
+        grupo_envio: grupoEnvio || null,
+        emails,
+        orden: siguienteOrden,
+        activo: true
+      });
+      if (error) throw error;
+
+      cerrarModalNuevaAgencia();
+      cargarEmailsAgencias();
+      if (typeof cargarAgenciasYTiendas === 'function') cargarAgenciasYTiendas();
+    } catch (err) {
+      console.error('Error creando la agencia:', err);
+      errEl.textContent = 'No se pudo crear la agencia. ¿Puede que ya exista una con ese nombre?';
+      errEl.style.display = 'block';
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  document.getElementById('btnNuevaAgencia')?.addEventListener('click', abrirModalNuevaAgencia);
+  document.getElementById('btnCerrarNuevaAgencia')?.addEventListener('click', cerrarModalNuevaAgencia);
+  document.getElementById('btnCancelarNuevaAgencia')?.addEventListener('click', cerrarModalNuevaAgencia);
+  document.getElementById('btnGuardarNuevaAgencia')?.addEventListener('click', guardarNuevaAgencia);
+  document.getElementById('nuevaAgenciaModalOverlay')?.addEventListener('click', (e) => {
+    if (e.target.id === 'nuevaAgenciaModalOverlay') cerrarModalNuevaAgencia();
+  });
+
+  // Se recarga SIEMPRE al entrar, para ver cambios de otros compañeros.
+  document.querySelectorAll('[data-view="config-emails"]').forEach(el => {
+    el.addEventListener('click', () => { cargarEmailsAgencias(); });
+  });
+  // Recarga las 3 listas de la página: agencias, Facturación y CC Transporte
+  document.getElementById('btnRecargarAgencias')?.addEventListener('click', (e) =>
+    recargarConGiro(e.currentTarget, cargarEmailsAgencias,
+      typeof cargarEmailsFacturacion === 'function' ? cargarEmailsFacturacion : null,
+      typeof cargarEmailsCC === 'function' ? cargarEmailsCC : null));
+
+  // ---------------------------------------------------------------

@@ -1,0 +1,417 @@
+// Informe diario de hoy
+  // ---------------------------------------------------------------
+        let fechaHoyISO = fechaLocalISO(hoy); // YYYY-MM-DD, en hora LOCAL
+
+  let informeHoyCache = null; // null = aún no comprobado / no existe
+  let incidenciasHoyCache = []; // filas de la tabla `incidencias` del informe de hoy
+
+  // Informe cerrado SIN incidencias: no se manda ningún correo, pero se marca
+  // como resuelto (informe_enviado = true) para que el Reporte mensual pinte
+  // OK ese día. Se distingue de un envío normal por el estado.
+  const ESTADO_CERRADO_SIN_INC = 'CERRADO SIN INCIDENCIAS';
+  function informeCerradoSinIncidencias(informe) {
+    return !!informe?.informe_enviado && informe?.estado === ESTADO_CERRADO_SIN_INC;
+  }
+  // Texto de estado de un informe (Inicio, Historial…).
+  function textoEstadoInforme(informe) {
+    if (!informe) return '';
+    if (informeCerradoSinIncidencias(informe)) return ESTADO_CERRADO_SIN_INC;
+    return informe.informe_enviado ? 'ENVIADO' : (informe.estado || 'ABIERTO');
+  }
+
+  async function cargarInformeHoy() {
+    mostrarCargandoGlobal();
+    try {
+      const { data, error } = await sb
+        .from('informes_diarios')
+        .select('id, fecha, total_palets, estado, informe_enviado, informe_enviado_en, informe_enviado_por, creado_por, creado_en, ajustes_puntuales, entregas_especiales')
+        .eq('fecha', fechaHoyISO)
+        .maybeSingle();
+      if (error) throw error;
+      informeHoyCache = data || null;
+    } catch (err) {
+      console.error('Error cargando informe de hoy:', err);
+      informeHoyCache = null;
+    } finally {
+      ocultarCargandoGlobal();
+    }
+    renderCardEstadoInforme();
+    if (informeHoyCache) await cargarIncidenciasHoy();
+    // Se vuelve a pintar ya con las incidencias (contadores y barra de revisadas)
+    if (informeHoyCache) renderCardEstadoInforme();
+    actualizarKpiIncidencias();
+    if (typeof actualizarKpiSiniestrosDesdeDB === 'function') actualizarKpiSiniestrosDesdeDB();
+    if (typeof renderBotonEnviarInforme === 'function') renderBotonEnviarInforme();
+    // Cambios hechos tras el envío que aún no se han comunicado.
+    if (typeof iaActualizarPendientesHoy === 'function') iaActualizarPendientesHoy();
+  }
+
+  // Tarjeta compacta "Informe de hoy" de Inicio: cabecera con el enlace
+  // "Ir al informe →" (como "Ver todo →" de Actividad reciente), estado,
+  // quién/cuándo, y una barra con las incidencias ya revisadas (las que no
+  // siguen en "Retraso Pdte Confirmar" / "Revisando posible incidencia").
+  function renderCardEstadoInforme() {
+    const card = document.getElementById('cardEstadoInforme');
+    if (!card) return;
+    const cabecera = (conEnlace) => `
+      <div class="inicio-card-head">
+        <h3>📋 Informe de hoy</h3>
+        ${conEnlace ? '<button type="button" class="inicio-link" id="btnIrInformeHoy" data-view="incidencias">Ir al informe →</button>' : ''}
+      </div>`;
+
+    if (!informeHoyCache) {
+      card.innerHTML = `${cabecera(false)}
+        <div class="inicio-informe">
+          <span class="inicio-informe-icono gris">📋</span>
+          <div class="inicio-informe-txt"><b>Sin informe abierto para hoy</b><span>Genera el informe diario para empezar a registrar incidencias.</span></div>
+          <button class="btn primary" id="btnGenerarInformeEmpty">Generar informe</button>
+        </div>`;
+      document.getElementById('btnGenerarInformeEmpty').addEventListener('click', generarInformeHoy);
+      return;
+    }
+
+    const cerradoSinInc = informeCerradoSinIncidencias(informeHoyCache);
+    const enviado = !!informeHoyCache.informe_enviado;
+    const horaDe = (iso) => iso ? new Date(iso).toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' }) + 'h' : null;
+    const marcadas = (incidenciasHoyCache || []).filter(i => i.marcada);
+    const sinRevisarLista = (typeof MOTIVOS_SIN_REVISAR !== 'undefined') ? MOTIVOS_SIN_REVISAR : ['RETRASO PDTE CONFIRMAR', 'REVISANDO POSIBLE INCIDENCIA'];
+    const sinRevisar = marcadas.filter(i => (i.motivo || []).some(m => sinRevisarLista.includes(m))).length;
+    const revisadas = marcadas.length - sinRevisar;
+    const agencias = new Set(marcadas.map(i => i.agencia_id).filter(Boolean)).size;
+    const pct = marcadas.length ? Math.round(revisadas / marcadas.length * 100) : 100;
+
+    const quien = enviado
+      ? [informeHoyCache.informe_enviado_por, horaDe(informeHoyCache.informe_enviado_en)]
+      : [informeHoyCache.creado_por, horaDe(informeHoyCache.creado_en)];
+    const detalle = [...quien.filter(Boolean), informeHoyCache.total_palets ? `${informeHoyCache.total_palets} palets previstos` : null].filter(Boolean).join(' · ');
+    const estadoTexto = textoEstadoInforme(informeHoyCache);
+    // Cerrado sin incidencias pero con alguna registrada después: queda
+    // pendiente de enviar (naranja), igual que un informe abierto.
+    const pendienteTrasCierre = cerradoSinInc && marcadas.length > 0;
+    const verde = enviado && !pendienteTrasCierre;
+    const pl = (n, s, p) => `${n} ${n === 1 ? s : p}`;
+
+    card.innerHTML = `${cabecera(true)}
+      <div class="inicio-informe">
+        <span class="inicio-informe-icono ${verde ? 'verde' : 'naranja'}">${verde ? '✅' : '📝'}</span>
+        <div class="inicio-informe-txt">
+          <b>${pendienteTrasCierre ? `Cerrado sin incidencias · ${pl(marcadas.length, 'incidencia', 'incidencias')} sin enviar` : cerradoSinInc ? 'Cerrado sin incidencias · no se envió ningún correo' : enviado ? 'Enviado a las agencias' : (marcadas.length ? `Abierto · ${pl(marcadas.length, 'incidencia', 'incidencias')} sin enviar` : 'Abierto · sin incidencias todavía')}</b>
+          <span>${escapeHtml(detalle || '—')}</span>
+        </div>
+        <span class="inicio-estado ${verde ? 'verde' : 'naranja'}">${escapeHtml(estadoTexto)}</span>
+      </div>
+      <div class="inicio-progreso${sinRevisar ? ' pendiente' : ''}" title="${revisadas} de ${marcadas.length} incidencias revisadas"><i style="width:${pct}%"></i></div>
+      <div class="inicio-informe-datos">
+        <span><b>${marcadas.length}</b> incidencias</span>
+        <span${sinRevisar ? ' class="aviso"' : ''}><b>${revisadas}</b> de ${marcadas.length} revisadas</span>
+        <span><b>${agencias}</b> ${agencias === 1 ? 'agencia' : 'agencias'}</span>
+      </div>`;
+
+    document.getElementById('btnIrInformeHoy').addEventListener('click', async () => {
+      if (typeof confirmarDescartarEdicionHistorial === 'function' && !(await confirmarDescartarEdicionHistorial())) return;
+      if (typeof confirmarDescartarEdicionGravedadMotivos === 'function' && !(await confirmarDescartarEdicionGravedadMotivos())) return;
+      activarVista('incidencias');
+      renderVistaIncidencias();
+    });
+  }
+
+  async function generarInformeHoy() {
+    const palets = await modalPrompt('¿Cuántos palets se prevé entregar hoy? (opcional)', {
+      titulo: 'Generar informe de hoy',
+      placeholder: 'Ej. 120',
+      tipo: 'number'
+    });
+    // Igual que antes: si se cancela o se deja vacío, se genera el informe sin palets.
+    try {
+      const { data, error } = await sb.from('informes_diarios').insert({
+        fecha: fechaHoyISO,
+        total_palets: palets ? Number(palets) || null : null,
+        creado_por: sesionActual?.nombre || sesionActual?.usuario || null
+      }).select().single();
+      if (error) throw error;
+      informeHoyCache = data;
+      renderCardEstadoInforme();
+      cargarKPIs();
+      if (typeof renderBotonEnviarInforme === 'function') renderBotonEnviarInforme();
+      renderVistaIncidencias();
+    } catch (err) {
+      console.error('Error generando informe:', err);
+      await modalAlert('No se pudo generar el informe de hoy.', { titulo: 'Error' });
+    }
+  }
+
+  async function actualizarKpiIncidencias() {
+    document.getElementById('kpiIncidenciasHoy').textContent = informeHoyCache
+      ? incidenciasHoyCache.filter(i => i.marcada).length
+      : '0';
+    // Comparación con el informe anterior en la tarjeta de Inicio
+    if (typeof inicioActualizarKpiIncidencias === 'function') inicioActualizarKpiIncidencias();
+    // El botón cambia entre "Cerrar sin incidencias" y "Enviar informe"
+    // según haya o no incidencias marcadas.
+    if (typeof renderBotonEnviarInforme === 'function') renderBotonEnviarInforme();
+  }
+
+  // ---------------------------------------------------------------
+  // Incidencias del día
+  // ---------------------------------------------------------------
+  async function cargarIncidenciasHoy() {
+    if (!informeHoyCache) { incidenciasHoyCache = []; return; }
+    try {
+      const { data, error } = await sb
+        .from('incidencias')
+        .select('id, tienda_id, entrega, marcada, tipo, motivo, observaciones, agencia_id, tienda_hora_prevista, tienda_nombre, agencia_nombre')
+        .eq('informe_id', informeHoyCache.id);
+      if (error) throw error;
+      incidenciasHoyCache = data || [];
+    } catch (err) {
+      console.error('Error cargando incidencias de hoy:', err);
+      incidenciasHoyCache = [];
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // Comprobación de cambio de día (por si el dispositivo/pestaña se
+  // queda abierto de un día para otro sin recargar la página)
+  // ---------------------------------------------------------------
+  function comprobarCambioDeDia() {
+    const ahora = new Date();
+    const fechaActualISO = fechaLocalISO(ahora);
+    if (fechaActualISO === fechaHoyISO) return; // sigue siendo el mismo día
+
+    hoy = ahora;
+    fechaHoyISO = fechaActualISO;
+    actualizarFechaHoyTexto();
+    historialFechaInput.max = fechaHoyISO;
+    historialSiniestrosFechaInput.max = fechaHoyISO;
+
+    if (!getSesion()) return; // en la pantalla de login, no hay nada que refrescar
+
+    cargarInformeHoy();
+    cargarKPIs();
+
+    if (document.getElementById('view-incidencias')?.classList.contains('active')) {
+      renderVistaIncidencias();
+    }
+    if (document.getElementById('view-siniestros')?.classList.contains('active')) {
+      renderVistaSiniestros();
+    }
+  }
+
+  setInterval(comprobarCambioDeDia, 60 * 1000); // revisa cada minuto
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') comprobarCambioDeDia();
+  });
+
+  // ---------------------------------------------------------------
+  // Historial de informes diarios
+  // ---------------------------------------------------------------
+  const historialFechaInput = document.getElementById('historialFechaInput');
+  historialFechaInput.max = fechaHoyISO;
+
+  // Último informe consultado en "Historial de informes diarios" (para poder
+  // exportarlo a PDF sin volver a pedirlo a Supabase).
+  let historialInformeActual = null;
+  let historialIncidenciasActual = [];
+
+  function renderVistaHistorialInformes() {
+    if (!historialFechaInput.value) historialFechaInput.focus();
+  }
+
+  document.getElementById('btnBuscarHistorial').addEventListener('click', () => {
+    cargarInformeHistorial(historialFechaInput.value);
+  });
+
+  async function cargarInformeHistorial(fecha) {
+    const cont = document.getElementById('contenidoHistorial');
+    const wrapExportar = document.getElementById('exportarWrapHistorial');
+    const wrapFiltros = document.getElementById('historialFiltrosWrap');
+    const btnEditar = document.getElementById('btnEditarHistorial');
+    const btnLog = document.getElementById('btnLogCambiosHistorial');
+    if (!fecha) {
+      await modalAlert('Selecciona primero una fecha.', { titulo: 'Historial' });
+      return;
+    }
+
+    // Si se estaba editando otro informe con cambios sin guardar, hay que
+    // preguntar antes de abandonarlos (mismo modal que el botón "Salir").
+    if (typeof confirmarDescartarEdicionHistorial === 'function' && !(await confirmarDescartarEdicionHistorial())) return;
+    if (typeof confirmarDescartarEdicionGravedadMotivos === 'function' && !(await confirmarDescartarEdicionGravedadMotivos())) return;
+
+    cont.innerHTML = `<div class="card"><div class="empty"><p>Cargando informe del ${fecha}…</p></div></div>`;
+    if (wrapExportar) wrapExportar.style.display = 'none';
+    if (wrapFiltros) wrapFiltros.style.display = 'none';
+    if (btnEditar) btnEditar.style.display = 'none';
+    if (btnLog) btnLog.style.display = 'none';
+    const btnAct = document.getElementById('btnActualizacionHistorial');
+    if (btnAct) btnAct.style.display = 'none';
+    historialInformeActual = null;
+    historialIncidenciasActual = [];
+    historialEditando = false;
+    if (typeof mostrarFiltroSoloConIncidenciasHistorial === 'function') mostrarFiltroSoloConIncidenciasHistorial(false);
+    if (typeof limpiarFiltrosHistorialCompleto === 'function') limpiarFiltrosHistorialCompleto();
+
+    try {
+      mostrarCargandoGlobal();
+      const { data: informe, error: eInf } = await sb
+        .from('informes_diarios')
+        .select('id, fecha, total_palets, estado, informe_enviado, informe_enviado_en, entregas_especiales')
+        .eq('fecha', fecha)
+        .maybeSingle();
+      if (eInf) throw eInf;
+
+      if (!informe) {
+        cont.innerHTML = `
+          <div class="card">
+            <div class="empty">
+              <div class="glyph">🕓</div>
+              <h3>Sin informe ese día</h3>
+              <p>No se generó ningún informe diario para el ${fecha}.</p>
+            </div>
+          </div>`;
+        return;
+      }
+
+      // Solo incidencias activas (marcada = true) de ese informe.
+      // Usamos el snapshot guardado en la propia incidencia (tienda_nombre,
+      // tienda_hora_prevista, agencia_id, agencia_nombre) en vez de un join
+      // en vivo a tiendas/agencias, para que este histórico no cambie si
+      // más adelante se edita la tienda o la agencia.
+      const { data: incs, error: eInc } = await sb
+        .from('incidencias')
+        .select('id, tipo, motivo, observaciones, actualizado_en, usuario, tienda_nombre, tienda_hora_prevista, tienda_marca, agencia_id, agencia_nombre')
+        .eq('informe_id', informe.id)
+        .eq('marcada', true);
+      if (eInc) throw eInc;
+
+      if (typeof cargarBajasTiendas === 'function') await cargarBajasTiendas();
+      historialInformeActual = informe;
+      historialIncidenciasActual = incs || [];
+      if (wrapExportar) wrapExportar.style.display = '';
+      if (wrapFiltros) wrapFiltros.style.display = 'flex';
+      if (btnEditar) btnEditar.style.display = (informe.fecha === fechaHoyISO) ? 'none' : '';
+      if (btnLog) btnLog.style.display = informe.informe_enviado ? '' : 'none';
+
+      renderHistorialInforme();
+      if (typeof iaActualizarPendientesHistorial === 'function') iaActualizarPendientesHistorial();
+    } catch (err) {
+      console.error('Error cargando historial de informe:', err);
+      cont.innerHTML = `
+        <div class="card">
+          <div class="empty">
+            <div class="glyph">⚠️</div>
+            <h3>Error al cargar</h3>
+            <p>No se pudo consultar el informe de ese día.</p>
+          </div>
+        </div>`;
+    } finally {
+      ocultarCargandoGlobal();
+    }
+  }
+
+  function renderHistorialInforme() {
+    const informe = historialInformeActual;
+    if (!informe) return;
+    const cont = document.getElementById('contenidoHistorial');
+    const fechaInforme = new Date(informe.fecha + 'T00:00:00');
+    const fechaTexto = `${dias[fechaInforme.getDay()]}, ${formatearFechaCorta(fechaInforme)}`;
+    const estadoTexto = textoEstadoInforme(informe);
+
+    if (!historialIncidenciasActual.length) {
+      cont.innerHTML = `
+        <div class="card" style="margin-bottom:14px; padding:16px 20px;">
+          <b style="text-transform:capitalize;">${fechaTexto}</b>
+          ${informe.total_palets ? ` · ${informe.total_palets} palets previstos` : ''} · Estado: ${estadoTexto}
+        </div>
+        <div class="card">
+          <div class="empty">
+            <div class="glyph">✅</div>
+            <h3>Sin incidencias ese día</h3>
+            <p>No hubo ninguna incidencia activa registrada el ${fechaTexto}.</p>
+          </div>
+        </div>`;
+      return;
+    }
+
+    // Búsqueda por tienda + filtros (Agencia/Motivo/Tipo/Marca/Solo pendientes),
+    // igual que en "Informe del día" (js/historial-filtros.js).
+    const f = (document.getElementById('buscarTiendaHistorial')?.value || '').trim().toUpperCase();
+    let incidenciasActivas = historialIncidenciasActual;
+    if (f) incidenciasActivas = incidenciasActivas.filter(i => (i.tienda_nombre || '').toUpperCase().includes(f));
+    if (typeof filtrosHistorial !== 'undefined') {
+      if (filtrosHistorial.agencias.size) incidenciasActivas = incidenciasActivas.filter(i => filtrosHistorial.agencias.has(i.agencia_id));
+      if (filtrosHistorial.marcas.size) incidenciasActivas = incidenciasActivas.filter(i => filtrosHistorial.marcas.has(i.tienda_marca));
+      if (filtrosHistorial.tipos.size) incidenciasActivas = incidenciasActivas.filter(i => filtrosHistorial.tipos.has(i.tipo || 'PENDIENTE'));
+      if (filtrosHistorial.motivos.size) incidenciasActivas = incidenciasActivas.filter(i => (i.motivo || []).some(m => filtrosHistorial.motivos.has(m)));
+      if (filtrosHistorial.soloPendientes) incidenciasActivas = incidenciasActivas.filter(i => (i.motivo || []).some(m => m === 'RETRASO PDTE CONFIRMAR' || m === 'REVISANDO POSIBLE INCIDENCIA'));
+    }
+
+    if (!incidenciasActivas.length) {
+      cont.innerHTML = `
+        <div class="card" style="margin-bottom:14px; padding:16px 20px;">
+          <b style="text-transform:capitalize;">${fechaTexto}</b>
+          ${informe.total_palets ? ` · ${informe.total_palets} palets previstos` : ''} · Estado: ${estadoTexto}
+        </div>
+        <div class="card">
+          <div class="empty">
+            <div class="glyph">🔎</div>
+            <h3>Sin resultados</h3>
+            <p>Ninguna incidencia de ese día coincide con la búsqueda o los filtros.</p>
+          </div>
+        </div>`;
+      return;
+    }
+
+    // Agrupar por agencia (usando el snapshot guardado en la incidencia)
+    const porAgencia = {};
+    incidenciasActivas.forEach(inc => {
+      const agId = inc.agencia_id ?? 'sin-agencia';
+      if (!porAgencia[agId]) porAgencia[agId] = { nombre: inc.agencia_nombre || 'Sin agencia', filas: [] };
+      porAgencia[agId].filas.push(inc);
+    });
+
+    const bloques = Object.values(porAgencia).map(grupo => {
+      const filas = grupo.filas.map(inc => {
+        const tipo = inc.tipo;
+        const claseFila = typeof claseFilaIncidencia === 'function' ? claseFilaIncidencia(inc.motivo || []) || 'pendiente' : (tipo ? tipo.toLowerCase() : 'pendiente');
+        const badgeTipo = tipo
+          ? `<span class="pill ${tipo.toLowerCase()}">${tipo.charAt(0)+tipo.slice(1).toLowerCase()}</span>`
+          : `<span class="pill pendiente">Pendiente</span>`;
+        return `
+          <tr class="con-incidencia ${claseFila}">
+            <td class="col-hora">${inc.tienda_hora_prevista ? inc.tienda_hora_prevista.slice(0,5) : '—'}</td>
+            <td class="col-tienda">${inc.tienda_marca && inc.tienda_marca !== 'HABITUAL' && typeof badgeMarcaHtml === 'function' ? badgeMarcaHtml(inc.tienda_marca) : ''}${escapeHtml(inc.tienda_nombre || '—')}</td>
+            <td class="col-tipo">${badgeTipo}</td>
+            <td class="col-motivo">${escapeHtml((inc.motivo || []).join(', '))}</td>
+            <td class="col-obs">${escapeHtml(inc.observaciones || '')}</td>
+          </tr>`;
+      }).join('');
+
+      return `
+        <div class="agencia-block">
+          <div class="agencia-head open" style="cursor:default;">
+            <b>${escapeHtml(grupo.nombre)}</b>
+            <span class="conteo-inc">${grupo.filas.length} incidencia${grupo.filas.length===1?'':'s'}</span>
+          </div>
+          <div class="agencia-body open">
+            <table class="tabla-incidencias">
+              <colgroup>
+                <col class="cg-hora"><col class="cg-tienda">
+                <col class="cg-tipo"><col class="cg-motivo"><col class="cg-obs">
+              </colgroup>
+              <thead><tr><th>Hora</th><th>Tienda</th><th>Tipo</th><th>Motivo</th><th>Observaciones</th></tr></thead>
+              <tbody>${filas}</tbody>
+            </table>
+          </div>
+        </div>`;
+    }).join('');
+
+    cont.innerHTML = `
+      <div class="card" style="margin-bottom:14px; padding:16px 20px;">
+        <b style="text-transform:capitalize;">${fechaTexto}</b>
+        ${informe.total_palets ? ` · ${informe.total_palets} palets previstos` : ''} · Estado: ${estadoTexto}
+        · <span style="color:var(--grave); font-weight:700;">${incidenciasActivas.length} incidencia${incidenciasActivas.length===1?'':'s'} activa${incidenciasActivas.length===1?'':'s'}</span>
+      </div>
+      ${bloques}`;
+  }
+
+  // ---------------------------------------------------------------

@@ -1,0 +1,132 @@
+// ---------------------------------------------------------------
+// Aviso de "sin permiso" al pulsar un botón deshabilitado
+// ---------------------------------------------------------------
+// Los botones sin permiso se quedan visibles pero atenuados (ver
+// styles.css, reglas "pointer-events:none" → ahora solo opacidad
+// para los <button> reales; los campos de formulario dentro de esos
+// mismos bloques SIGUEN con pointer-events:none, no interesa un
+// modal por cada campo). Este archivo intercepta el clic en esos
+// botones ANTES de que llegue a su lógica normal y muestra un aviso
+// en vez de ejecutar la acción.
+//
+// Requiere (ya cargados antes): modalAlert (ui-modal.js), tienePermiso
+// / esLectura (permisos.js).
+
+function mostrarModalSinPermiso() {
+  if (typeof modalAlert !== 'function') return;
+  modalAlert('Usuario no cuenta con los permisos necesarios.', {
+    titulo: 'Sin permiso',
+    icono: '⛔',
+    danger: true
+  });
+}
+
+// Selector del botón → clave de permiso granular que necesita (mismo
+// mapeo que las reglas "body:not(.perm-X) SELECTOR{ opacity... }" de
+// styles.css, pero solo la parte de BOTONES, no la de campos).
+const BOTONES_CON_PERMISO = [
+  ['#btnEditarHistorial', 'editar_informes_pasados'],
+  ['#btnGenerarInformeEmpty', 'informe_dia'],
+  ['#btnGenerarInformeDesdeIncidencias', 'informe_dia'],
+  ['#btnEditarPalets', 'informe_dia'],
+  ['#btnEditarInformeHoy', 'informe_dia'],
+  ['.btn-borrar-motivos', 'informe_dia'],
+  ['#utilBtnGuardarAjuste', 'informe_dia'],
+  ['#utilBtnQuitarAjuste', 'informe_dia'],
+  ['.util-btn-quitar', 'informe_dia'],
+  ['#utilBtnGuardarEspecial', 'informe_dia'],
+  ['#utilBtnQuitarEspecial', 'informe_dia'],
+  ['.util-btn-quitar-especial', 'informe_dia'],
+  ['#btnNuevoPanelSiniestroManual', 'panel_siniestros'],
+  ['#btnImportarCobros', 'panel_siniestros'],
+  // Cerrar y PDF del detalle quedan libres (no modifican nada).
+  ['#psModalOverlay .btn:not(#btnCerrarPsModal):not(#btnImprimirPanelSiniestro)', 'panel_siniestros'],
+  ['#psModalOverlay .cvd-editar', 'panel_siniestros'],
+  ['#btnEnviarSiniestro', 'siniestros_dia'],
+  ['[id^="btnEnviarFacturacion"]', 'enviar_facturacion'],
+  ['#btnNuevaTienda', 'config_tiendas'],
+  // El lápiz ✏️ (data-editar) no va aquí: lo deja pasar también el permiso
+  // "Configurar pruebas" (abre Editar tienda solo con la tarjeta Prueba);
+  // el aviso lo da sinPermisoEditarTienda() en tiendas.js.
+  ['#view-config-tiendas .agencia-body .mini-btn:not([data-editar])', 'config_tiendas'],
+  ['#metBtnBaja', 'config_tiendas'],
+  ['[data-cancelar-programado]', 'config_tiendas'],
+  ['[data-activar-tienda]', 'config_tiendas'],
+  ['#metBtnActivar', 'config_tiendas'],
+  ['#metBtnCambiarAgencia', 'config_tiendas'],
+  ['#metBtnHorarioSemana', 'config_tiendas'],
+  ['#matBtnGuardar', 'config_tiendas'],
+  ['#mmaBtnGuardar', 'config_tiendas'],
+  // Gestión → Supervisores: mismo permiso que Tiendas.
+  ['#btnNuevoSupervisor', 'config_tiendas'],
+  ['#tablaSupervisoresBody .usr-ico', 'config_tiendas'],
+  ['#btnGuardarSupervisor', 'config_tiendas'],
+  ['#btnNuevaAgencia', 'config_emails'],
+  ['#listaEmailsAgencias [data-editar-comercial]', 'config_emails'],
+  ['#listaEmailsAgencias [data-editar-grupo]', 'config_emails'],
+  ['#listaEmailsAgencias [data-quitar]', 'config_emails'],
+  ['#listaEmailsAgencias .email-add-row button', 'config_emails'],
+  ['#listaEmailsAgencias [data-dar-baja]', 'config_emails'],
+  ['#listaEmailsAgencias [data-reactivar]', 'config_emails'],
+  ['#listaEmailsFacturacion .email-add-row button', 'config_facturacion'],
+  ['#listaEmailsFacturacion [data-quitar-facturacion]', 'config_facturacion'],
+  ['#listaEmailsCC .email-add-row button', 'config_cc_transporte'],
+  ['#listaEmailsCC [data-quitar-cc]', 'config_cc_transporte'],
+  ['#contenidoGravedadMotivos .gravedad-btn', 'config_gravedad_motivos'],
+  ['#contenidoGravedadMotivos [data-cambiar-nivel]', 'config_gravedad_motivos'],
+  ['#btnGuardarGravedadMotivos', 'config_gravedad_motivos'],
+  ['#btnBorrarPanelSiniestro', 'borrar'],
+  ['.ps-foto-quitar', 'borrar'],
+  ['#btnQuitarFactura', 'borrar'],
+  ['#btnQuitarAlbaran', 'borrar']
+];
+
+// Modo LECTURA: mismo selector de botones de acción que ya usa
+// styles.css para atenuarlos (ver regla "body.rol-lectura button...").
+const SELECTOR_BOTONES_LECTURA =
+  'button:not(.dropdown button):not(.toggle-seg-btn):not(.filtros-modal-close):not(.ps-kpi-detalle-btn):not(#btnRefrescarPanelSiniestros):not(.btn-recargar):not([data-view]):not(#btnCerrarPsModal):not(#btnImprimirPanelSiniestro), .btn:not(#btnCerrarPsModal):not(#btnImprimirPanelSiniestro), .link-accion, .mini-btn';
+
+// Páginas del menú que antes se ocultaban del todo para operadores sin
+// el permiso (Gestión de usuarios, Registro de auditoría): ahora se ven
+// siempre en el desplegable, pero si se pulsan sin el permiso no
+// navegan, avisan. A diferencia de BOTONES_CON_PERMISO, esto NO aplica
+// a lectura ni admin (igual que hacía la regla CSS que ocultaba antes:
+// estaba acotada a "body.rol-operador").
+const PESTAÑAS_SOLO_OPERADOR = [
+  ['[data-view="config-usuarios"]', 'gestion_usuarios'],
+  ['[data-view="config-auditoria"]', 'ver_auditoria']
+];
+
+document.addEventListener('click', (e) => {
+  if (typeof esLectura === 'function' && esLectura()) {
+    const elLectura = e.target.closest(SELECTOR_BOTONES_LECTURA);
+    if (elLectura) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      mostrarModalSinPermiso();
+      return;
+    }
+  }
+
+  if (typeof esOperador === 'function' && esOperador()) {
+    for (const [selector, permiso] of PESTAÑAS_SOLO_OPERADOR) {
+      const elPestaña = e.target.closest(selector);
+      if (elPestaña && typeof tienePermiso === 'function' && !tienePermiso(permiso)) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        mostrarModalSinPermiso();
+        return;
+      }
+    }
+  }
+
+  for (const [selector, permiso] of BOTONES_CON_PERMISO) {
+    const el = e.target.closest(selector);
+    if (el && typeof tienePermiso === 'function' && !tienePermiso(permiso)) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      mostrarModalSinPermiso();
+      return;
+    }
+  }
+}, true);

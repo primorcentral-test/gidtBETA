@@ -1,0 +1,135 @@
+// ---------------------------------------------------------------
+  // Comprobación de versión y aviso de actualización de la PWA
+  // ---------------------------------------------------------------
+  (function () {
+    const VERSION_URL = 'version.json';
+    const INTERVALO_MS = 3 * 60 * 1000; // comprobar cada 3 minutos
+    let versionActual = null;
+    let modalMostrado = false;
+
+    async function obtenerVersionRemota() {
+      try {
+        const resp = await fetch(VERSION_URL + '?t=' + Date.now(), { cache: 'no-store' });
+        if (!resp.ok) return null;
+        const data = await resp.json();
+        return data.version || null;
+      } catch {
+        return null;
+      }
+    }
+
+    async function comprobarVersionInicial() {
+      versionActual = await obtenerVersionRemota();
+      const tag = document.getElementById('appVersionTag');
+      if (tag && versionActual) tag.textContent = 'v' + versionActual;
+      const loginTag = document.getElementById('loginVersionTag');
+      if (loginTag && versionActual) loginTag.textContent = 'Versión ' + versionActual;
+    }
+
+    async function comprobarActualizacion() {
+      if (modalMostrado || !versionActual) return;
+      const remota = await obtenerVersionRemota();
+      if (!remota) return;
+      if (remota !== versionActual) {
+        modalMostrado = true;
+        mostrarAvisoActualizacion(versionActual, remota);
+      }
+    }
+
+    // Modal dedicado (no el genérico de modalAlert/modalConfirm): a propósito
+    // no se puede cerrar haciendo click fuera ni con Escape, porque la
+    // actualización no es opcional — solo se sale de aquí actualizando.
+    // Lleva una escena animada (perro paseando con la nueva versión); al
+    // pulsar "Actualizar ahora" el perro echa a correr y sale una barra de
+    // progreso mientras se limpia la caché y se recarga.
+    function mostrarAvisoActualizacion(actual, nueva) {
+      const overlay = document.getElementById('actualizacionModalOverlay');
+      const btn = document.getElementById('btnActualizarAhora');
+      const caja = overlay.querySelector('.actualizacion-modal-box');
+      const escena = document.getElementById('actEscena');
+      const mensaje = document.getElementById('actualizacionModalMensaje');
+
+      if (actual && nueva) {
+        document.getElementById('actVersionActual').textContent = 'v' + actual;
+        document.getElementById('actVersionNueva').textContent = 'v' + nueva;
+        document.getElementById('actVersiones').hidden = false;
+        const chapa = document.getElementById('actChapaVersion');
+        if (chapa) chapa.textContent = 'v' + nueva;
+      }
+
+      overlay.classList.add('show');
+      btn.addEventListener('click', () => {
+        btn.disabled = true;
+        btn.textContent = 'Actualizando…';
+        if (caja) caja.classList.add('actualizando');
+        if (escena) escena.style.setProperty('--vel', '2.4');
+        if (mensaje) mensaje.textContent = 'Descargando la nueva versión… no cierres la aplicación.';
+        forzarActualizacion();
+      }, { once: true });
+    }
+
+    // Tiempo mínimo que se ve la animación de "Actualizando…" (el perro
+    // corriendo) antes de recargar: la limpieza de caché suele tardar
+    // menos de un segundo y, sin esto, la animación apenas se llegaba a ver.
+    const DURACION_MINIMA_ACTUALIZANDO_MS = 3500;
+
+    async function forzarActualizacion() {
+      const inicio = Date.now();
+      try {
+        if ('serviceWorker' in navigator) {
+          const registros = await navigator.serviceWorker.getRegistrations();
+          await Promise.all(registros.map((r) => r.unregister()));
+        }
+        if (window.caches) {
+          const claves = await caches.keys();
+          await Promise.all(claves.map((k) => caches.delete(k)));
+        }
+        // Lo anterior limpia el Service Worker y su caché interna, pero el
+        // propio navegador puede seguir teniendo el HTML/CSS/JS de la app
+        // guardados en su caché HTTP normal (independiente del Service
+        // Worker) y servirlos tal cual en el recargado siguiente — por eso
+        // antes se veía la versión antigua hasta cerrar y reabrir la app.
+        // Se refresca explícitamente esa caché para cada archivo propio de
+        // la página (mismo origen) antes de recargar.
+        const urlsPropias = Array.from(document.querySelectorAll('link[href], script[src]'))
+          .map(el => el.href || el.src)
+          .filter(url => url && url.startsWith(location.origin));
+        urlsPropias.push(location.origin + location.pathname);
+        await Promise.all(urlsPropias.map(url => fetch(url, { cache: 'reload' }).catch(() => {})));
+      } catch (err) {
+        console.error('Error limpiando caché al actualizar:', err);
+      } finally {
+        const restante = DURACION_MINIMA_ACTUALIZANDO_MS - (Date.now() - inicio);
+        if (restante > 0) await new Promise(r => setTimeout(r, restante));
+        // Esta recarga es intencionada: se marca para que los avisos
+        // "beforeunload" (auth.js, historial-editar.js,
+        // config-gravedad-motivos.js) no muestren el cuadro del navegador
+        // "¿Quieres volver a cargar la aplicación?", que confundía a la gente.
+        window.RECARGA_POR_ACTUALIZACION_ = true;
+        location.reload();
+      }
+    }
+
+    // Comprobar al volver a la app (tras minimizar, cambiar de pestaña, etc.)
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') comprobarActualizacion();
+    });
+    window.addEventListener('focus', comprobarActualizacion);
+
+    // Arranque: guardamos la versión con la que se cargó la app y
+    // empezamos a comprobar periódicamente si ha cambiado en el servidor.
+    comprobarVersionInicial().then(() => {
+      setInterval(comprobarActualizacion, INTERVALO_MS);
+    });
+
+    // Registro del Service Worker
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('sw.js').catch((err) => {
+          console.error('Error registrando Service Worker:', err);
+        });
+      });
+    }
+  })();
+
+  // ---------------------------------------------------------------

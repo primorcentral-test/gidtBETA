@@ -1,0 +1,585 @@
+// Selects desplegables (Agencia / Tipo / Motivo) dentro del panel
+  // ---------------------------------------------------------------
+  const NOMBRES_FILTRO_GRUPO = { agencia: 'agencia', tipo: 'tipo', motivo: 'motivo', marca: 'marca' };
+
+  function actualizarValoresSelects() {
+    // Ojo: solo los selects DEL PANEL de Informe del día — de lo contrario
+    // tocaría también los .filtro-select de otros paneles (p. ej. el de
+    // Análisis), que usan los mismos nombres de grupo pero sus propios Sets.
+    document.querySelectorAll('#filtrosPanel .filtro-select').forEach(sel => {
+      const grupo = sel.dataset.grupo;
+      const set = grupo === 'agencia' ? filtrosIncidencias.agencias
+                : grupo === 'tipo' ? filtrosIncidencias.tipos
+                : grupo === 'marca' ? filtrosIncidencias.marcas
+                : filtrosIncidencias.motivos;
+      const valor = sel.querySelector('.filtro-select-valor');
+      if (set.size === 0) {
+        valor.textContent = 'Todos';
+        sel.classList.remove('activo');
+      } else if (set.size === 1) {
+        const cb = sel.querySelector('input[type="checkbox"]:checked');
+        valor.textContent = cb ? cb.closest('.filtro-check').textContent.trim() : `${set.size} seleccionados`;
+        sel.classList.add('activo');
+      } else {
+        valor.textContent = `${set.size} seleccionados`;
+        sel.classList.add('activo');
+      }
+    });
+  }
+
+  function cerrarTodosLosSelects(excepto) {
+    document.querySelectorAll('.filtro-select.open').forEach(sel => {
+      if (sel !== excepto) sel.classList.remove('open');
+    });
+  }
+
+  document.querySelectorAll('.filtro-select').forEach(sel => {
+    const btn = sel.querySelector('.filtro-select-btn');
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const yaAbierto = sel.classList.contains('open');
+      cerrarTodosLosSelects(sel);
+      sel.classList.toggle('open', !yaAbierto);
+    });
+    const buscador = sel.querySelector('.filtro-select-search input');
+    if (buscador) {
+      buscador.addEventListener('click', (e) => e.stopPropagation());
+      buscador.addEventListener('input', () => {
+        const q = buscador.value.trim().toUpperCase();
+        sel.querySelectorAll('.filtro-check').forEach(row => {
+          const texto = row.textContent.trim().toUpperCase();
+          row.classList.toggle('oculto', q && !texto.includes(q));
+        });
+      });
+    }
+  });
+
+  document.addEventListener('click', () => cerrarTodosLosSelects(null));
+
+  const TIPOS_FILTRO = [
+    { v: 'GRAVE', label: 'Grave' },
+    { v: 'MODERADO', label: 'Moderado' },
+    { v: 'LEVE', label: 'Leve' },
+    { v: 'PENDIENTE', label: 'Pendiente' }
+  ];
+
+  const MARCAS_FILTRO = [
+    { v: 'HABITUAL', label: 'Habitual' },
+    { v: 'SABADO', label: 'Sábado' },
+    { v: 'PRUEBA', label: 'Prueba' },
+    { v: 'ESPECIAL', label: 'Especial' }
+  ];
+
+  function construirPanelFiltrosIncidencias() {
+    const listaAg = document.getElementById('filtrosAgenciasLista');
+    const listaTipos = document.getElementById('filtrosTiposLista');
+    const listaMotivos = document.getElementById('filtrosMotivosLista');
+    const listaMarcas = document.getElementById('filtrosMarcasLista');
+
+    if (!listaAg.dataset.built) {
+      listaAg.innerHTML = agenciasParaFiltro().map(ag => `
+        <label class="filtro-check">
+          <input type="checkbox" value="${ag.id}" data-filtro="agencia">
+          <span>${escapeHtml(nombreAgenciaFiltro(ag))}</span>
+        </label>`).join('');
+      listaAg.dataset.built = '1';
+    }
+
+    if (!listaTipos.dataset.built) {
+      listaTipos.innerHTML = TIPOS_FILTRO.map(t => `
+        <label class="filtro-check">
+          <input type="checkbox" value="${t.v}" data-filtro="tipo">
+          <span class="pill ${t.v.toLowerCase()}">${t.label}</span>
+        </label>`).join('');
+      listaTipos.dataset.built = '1';
+    }
+
+    if (!listaMotivos.dataset.built) {
+      listaMotivos.innerHTML = MOTIVOS.map(m => `
+        <label class="filtro-check motivo-${m.clase}">
+          <input type="checkbox" value="${escapeHtml(m.v)}" data-filtro="motivo">
+          <span>${m.v}</span>
+        </label>`).join('');
+      listaMotivos.dataset.built = '1';
+    }
+
+    if (!listaMarcas.dataset.built) {
+      listaMarcas.innerHTML = MARCAS_FILTRO.map(m => `
+        <label class="filtro-check">
+          <input type="checkbox" value="${m.v}" data-filtro="marca">
+          <span>${m.label}</span>
+        </label>`).join('');
+      listaMarcas.dataset.built = '1';
+    }
+
+    const panel = document.getElementById('filtrosPanel');
+    if (!panel.dataset.wired) {
+      panel.addEventListener('change', (e) => {
+        const cb = e.target;
+        if (!cb.matches('input[type="checkbox"]')) return;
+        if (cb.id === 'filtroSoloConIncidencias') {
+          filtrosIncidencias.soloConIncidencias = cb.checked;
+          actualizarBadgeFiltros();
+          renderAcordeonIncidencias(document.getElementById('buscarTiendaIncidencias').value);
+          return;
+        }
+        if (cb.id === 'filtroSoloPendientes') {
+          filtrosIncidencias.soloPendientes = cb.checked;
+          actualizarBadgeFiltros();
+          renderAcordeonIncidencias(document.getElementById('buscarTiendaIncidencias').value);
+          return;
+        }
+        const grupo = cb.dataset.filtro;
+        const set = grupo === 'agencia' ? filtrosIncidencias.agencias
+                  : grupo === 'tipo' ? filtrosIncidencias.tipos
+                  : grupo === 'marca' ? filtrosIncidencias.marcas
+                  : filtrosIncidencias.motivos;
+        const val = grupo === 'agencia' ? Number(cb.value) : cb.value;
+        if (cb.checked) set.add(val); else set.delete(val);
+        actualizarBadgeFiltros();
+        actualizarValoresSelects();
+        renderAcordeonIncidencias(document.getElementById('buscarTiendaIncidencias').value);
+      });
+      panel.dataset.wired = '1';
+    }
+  }
+
+  function actualizarBadgeFiltros() {
+    const total = filtrosIncidencias.agencias.size + filtrosIncidencias.tipos.size + filtrosIncidencias.motivos.size + filtrosIncidencias.marcas.size + (filtrosIncidencias.soloConIncidencias ? 1 : 0) + (filtrosIncidencias.soloPendientes ? 1 : 0);
+    const badge = document.getElementById('filtrosCount');
+    const btn = document.getElementById('btnFiltrosIncidencias');
+    if (total > 0) {
+      badge.textContent = total;
+      badge.style.display = '';
+      btn.classList.add('activo');
+    } else {
+      badge.style.display = 'none';
+      btn.classList.remove('activo');
+    }
+  }
+
+  const btnFiltrosIncidencias = document.getElementById('btnFiltrosIncidencias');
+  const filtrosPanel = document.getElementById('filtrosPanel');
+
+  function posicionarFiltrosPanel() {
+    const wrap = btnFiltrosIncidencias.closest('.filtros-wrap');
+    const wrapRect = wrap.getBoundingClientRect();
+    const margen = 12;
+    const ancho = Math.min(560, bordeDerechoVisible() - margen * 2);
+    filtrosPanel.style.width = ancho + 'px';
+    let left = 0;
+    const desbordeDerecha = (wrapRect.left + left + ancho) - (bordeDerechoVisible() - margen);
+    if (desbordeDerecha > 0) left -= desbordeDerecha;
+    if (wrapRect.left + left < margen) left = margen - wrapRect.left;
+    filtrosPanel.style.left = left + 'px';
+  }
+
+  function abrirFiltrosPanel() {
+    // Si el panel de "Exportar" o el de "Utilidades" están abiertos, los
+    // cerramos primero para que no se solapen varios paneles a la vez.
+    if (typeof cerrarTodosLosExportarPaneles === 'function') cerrarTodosLosExportarPaneles();
+    if (typeof cerrarUtilidadesPanel === 'function') cerrarUtilidadesPanel();
+    posicionarFiltrosPanel();
+    filtrosPanel.classList.add('show');
+    btnFiltrosIncidencias.classList.add('open');
+  }
+  function cerrarFiltrosPanel() {
+    filtrosPanel.classList.remove('show');
+    btnFiltrosIncidencias.classList.remove('open');
+    cerrarTodosLosSelects(null);
+  }
+
+  window.addEventListener('resize', () => {
+    if (filtrosPanel.classList.contains('show')) posicionarFiltrosPanel();
+  });
+
+  btnFiltrosIncidencias.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (filtrosPanel.classList.contains('show')) cerrarFiltrosPanel();
+    else abrirFiltrosPanel();
+  });
+
+  filtrosPanel.addEventListener('click', (e) => e.stopPropagation());
+
+  document.addEventListener('click', (e) => {
+    if (!filtrosPanel.contains(e.target) && !btnFiltrosIncidencias.contains(e.target)) {
+      cerrarFiltrosPanel();
+    }
+  });
+
+  document.getElementById('btnCerrarFiltros').addEventListener('click', cerrarFiltrosPanel);
+
+  document.getElementById('btnLimpiarFiltros').addEventListener('click', () => {
+    filtrosIncidencias.agencias.clear();
+    filtrosIncidencias.tipos.clear();
+    filtrosIncidencias.motivos.clear();
+    filtrosIncidencias.marcas.clear();
+    filtrosIncidencias.soloConIncidencias = false;
+    filtrosIncidencias.soloPendientes = false;
+    document.querySelectorAll('#filtrosPanel input[type="checkbox"]').forEach(cb => cb.checked = false);
+    actualizarBadgeFiltros();
+    actualizarValoresSelects();
+    renderAcordeonIncidencias(document.getElementById('buscarTiendaIncidencias').value);
+  });
+
+  // Envoltorio: cuenta los guardados en curso para que la auto-actualización
+  // del Informe del día (informe-autorefresh.js) no repinte la tabla mientras
+  // hay uno a medias.
+  async function guardarIncidencia(tiendaId, tr) {
+    window.guardandoIncidencias = (window.guardandoIncidencias || 0) + 1;
+    try {
+      return await guardarIncidenciaInterno(tiendaId, tr);
+    } finally {
+      window.guardandoIncidencias -= 1;
+    }
+  }
+
+  async function guardarIncidenciaInterno(tiendaId, tr) {
+    const entrega = tr?.dataset?.entrega || 'HABITUAL';
+    let motivos = Array.from(tr.querySelectorAll('.i-motivo-check:checked')).map(cb => cb.value);
+    const observaciones = tr.querySelector('.i-obs').value.trim().toUpperCase();
+
+    // Nunca se guarda NO ENTREGAN / FALTAS sin su submotivo (ver
+    // completarSubmotivos en submotivos-informe.js). Si el usuario cancela,
+    // ya se ha desmarcado el motivo y se ha relanzado el guardado limpio.
+    if (typeof completarSubmotivos === 'function') {
+      const completos = await completarSubmotivos(tr, motivos, incidenciaDeTienda(tiendaId, entrega)?.motivo);
+      if (completos === null) return;
+      motivos = completos;
+    }
+
+    const marcada = motivos.length > 0;
+    const tipo = calcularTipo(motivos);
+
+    // Si esta incidencia ya tiene un siniestro ENVIADO a la agencia y el
+    // cambio la dejaría sin motivo de siniestro (p. ej. desmarcar "Rotura
+    // confirmada" a mano, sin pasar por la papelera), no se permite: hay
+    // que gestionarlo desde el Panel siniestros.
+    const tipoSiniestroNuevo = typeof tipoSiniestroDeMotivos === 'function' ? tipoSiniestroDeMotivos(motivos) : null;
+    const existente = incidenciaDeTienda(tiendaId, entrega);
+    if (existente && !tipoSiniestroNuevo) {
+      try {
+        const { data: sinExistente } = await sb.from('siniestros').select('id, estado').eq('incidencia_id', existente.id).maybeSingle();
+        if (sinExistente?.estado === 'ENVIADO') {
+          await modalAlert('Este siniestro ya se ha enviado a la agencia. Para eliminarlo, hazlo desde el Panel siniestros.', { titulo: 'No se puede modificar' });
+          const motivosPrevios = existente.motivo || [];
+          tr.querySelectorAll('.i-motivo-check').forEach(cb => { cb.checked = motivosPrevios.includes(cb.value); });
+          const hayMotivoPrevio = motivosPrevios.length > 0;
+          tr.querySelector('.i-obs').disabled = !hayMotivoPrevio;
+          const btnBorrarMotivos = tr.querySelector('.btn-borrar-motivos');
+          if (btnBorrarMotivos) btnBorrarMotivos.style.display = hayMotivoPrevio ? '' : 'none';
+          const valorEl = tr.querySelector('.motivo-select-valor');
+          if (valorEl && typeof resumenMotivos === 'function') {
+            valorEl.textContent = resumenMotivos(motivosPrevios);
+            valorEl.title = typeof tituloMotivos === 'function' ? tituloMotivos(motivosPrevios) : '';
+          }
+          return;
+        }
+      } catch (err) {
+        console.error('Error comprobando el estado del siniestro:', err);
+      }
+    }
+
+    // Si se han desmarcado todos los motivos y ya había una incidencia
+    // guardada, se borra la fila entera de Supabase (y su siniestro
+    // asociado, si lo hay) en vez de dejarla guardada "vacía" — mismo
+    // comportamiento que el botón de la papelera (🗑 "Quitar todos los
+    // motivos"), pero sin el modal de confirmación porque aquí es el
+    // usuario quien ya ha ido desmarcando uno a uno, no un borrado de golpe.
+    if (!marcada && existente) {
+      try {
+        if (typeof psBorrarFilaPanelSinEnviar === 'function') await psBorrarFilaPanelSinEnviar({ incidenciaId: existente.id });
+        const { error: eSin } = await sb.from('siniestros').delete().eq('incidencia_id', existente.id);
+        if (eSin) throw eSin;
+
+        const { error: eInc } = await sb.from('incidencias').delete().eq('id', existente.id);
+        if (eInc) throw eInc;
+
+        if (typeof registrarCambioInformeSiEnviado === 'function') {
+          const tiendaLog = (typeof tiendaEfectivaHoyEntrega === 'function' ? tiendaEfectivaHoyEntrega(tiendaId, entrega) : null) || tiendasCache.find(t => t.id === tiendaId);
+          const agenciaLog = agenciasCache.find(a => a.id === (existente.agencia_id || tiendaLog?.agencia_id));
+          registrarCambioInformeSiEnviado(informeHoyCache, {
+            tiendaId,
+            tiendaNombre: existente.tienda_nombre || tiendaLog?.nombre,
+            agenciaNombre: existente.agencia_nombre || agenciaLog?.nombre,
+            motivosAntes: existente.motivo || [],
+            motivosDespues: [],
+            observacionesAntes: existente.observaciones || '',
+            observacionesDespues: ''
+          });
+        }
+
+        tr.querySelector('.i-obs').value = '';
+        cancelarSalidaFiltro(tiendaId, entrega);
+
+        await cargarIncidenciasHoy();
+
+        if (filtrosActivos()) {
+          renderAcordeonIncidencias(document.getElementById('buscarTiendaIncidencias').value);
+        } else {
+          actualizarFilaIncidencia(tiendaId, tr);
+        }
+        actualizarKpiIncidencias();
+
+        // Igual que hace la papelera: refresca también la caché/KPI/kanban
+        // de Siniestros, por si el siniestro borrado ya se había cargado ahí.
+        if (typeof siniestrosHoyCache !== 'undefined') {
+          siniestrosHoyCache = siniestrosHoyCache.filter(s => s.incidencia.id !== existente.id);
+          if (typeof actualizarKpiSiniestros === 'function') actualizarKpiSiniestros();
+          if (document.getElementById('view-siniestros')?.classList.contains('active') && typeof renderKanbanSiniestros === 'function') {
+            renderKanbanSiniestros();
+          }
+        }
+        if (typeof actualizarKpiSiniestrosDesdeDB === 'function') actualizarKpiSiniestrosDesdeDB();
+      } catch (err) {
+        console.error('Error eliminando incidencia:', err);
+        await modalAlert('No se pudo eliminar la incidencia.', { titulo: 'Error' });
+      }
+      return;
+    }
+
+    try {
+      // Snapshot: guardamos cómo es la tienda/agencia HOY, en el momento de
+      // guardar la incidencia. Así, si más adelante se edita la tienda
+      // (hora, nombre, agencia...), el histórico de este día no cambia.
+      // Se usa la versión "efectiva" de la tienda (aplicando el cambio
+      // puntual de hora/agencia de "Utilidades" si hoy tiene uno), para que
+      // el informe de hoy y su histórico queden con el dato correcto.
+      // Entregas de prueba/especial: snapshot con SU agencia y hora; si esa
+      // entrega ya no existe (se quitó), se conserva lo que había guardado.
+      let tienda = typeof tiendaEfectivaHoyEntrega === 'function'
+        ? tiendaEfectivaHoyEntrega(tiendaId, entrega)
+        : (typeof tiendaEfectivaHoy === 'function' ? tiendaEfectivaHoy(tiendaId) : tiendasCache.find(t => t.id === tiendaId));
+      if (!tienda && existente) {
+        const base = tiendasCache.find(t => t.id === tiendaId);
+        tienda = base ? { ...base, agencia_id: existente.agencia_id, hora_prevista: existente.tienda_hora_prevista, entrega } : null;
+      }
+      const agencia = tienda ? agenciasCache.find(a => a.id === tienda.agencia_id) : null;
+
+      const { error } = await sb.from('incidencias').upsert({
+        informe_id: informeHoyCache.id,
+        tienda_id: tiendaId,
+        entrega,
+        marcada, tipo, motivo: motivos, observaciones,
+        usuario: sesionActual?.nombre || sesionActual?.usuario || null,
+        actualizado_en: new Date().toISOString(),
+        tienda_nombre: tienda?.nombre || null,
+        tienda_hora_prevista: tienda?.hora_prevista || null,
+        tienda_marca: tienda ? (typeof marcaDeFilaInforme === 'function' ? marcaDeFilaInforme(tienda) : tienda.marca) : null,
+        agencia_id: tienda?.agencia_id || null,
+        agencia_nombre: agencia?.nombre || null
+      }, { onConflict: 'informe_id,tienda_id,entrega' });
+      if (error) throw error;
+
+      if (typeof registrarCambioInformeSiEnviado === 'function') {
+        registrarCambioInformeSiEnviado(informeHoyCache, {
+          tiendaId,
+          tiendaNombre: tienda?.nombre || existente?.tienda_nombre,
+          agenciaNombre: agencia?.nombre || existente?.agencia_nombre,
+          motivosAntes: existente?.motivo || [],
+          motivosDespues: motivos,
+          observacionesAntes: existente?.observaciones || '',
+          observacionesDespues: observaciones
+        });
+      }
+
+      await cargarIncidenciasHoy();
+
+      // Crea/actualiza/borra el siniestro asociado (ROTURA/FALTA/MIXTO) al instante,
+      // sin esperar a que se entre en la pestaña Siniestros.
+      const incGuardada = incidenciaDeTienda(tiendaId, entrega);
+      if (incGuardada && typeof sincronizarSiniestroIncidencia === 'function') {
+        sincronizarSiniestroIncidencia(incGuardada.id, motivos);
+      }
+
+      // Se actualiza solo la fila (sin repintar el listado, que cerraría el
+      // desplegable o quitaría el foco de Observaciones). Si con filtros
+      // activos la fila ya no los cumple, no desaparece al momento: arranca
+      // una cuenta atrás (ver iniciarSalidaFiltro en siniestros-historial.js).
+      actualizarFilaIncidencia(tiendaId, tr);
+      if (filtrosActivos() && !filaCumpleFiltrosIncidencias(tiendaId, entrega)) {
+        iniciarSalidaFiltro(tiendaId, entrega);
+      } else {
+        cancelarSalidaFiltro(tiendaId, entrega);
+      }
+      actualizarKpiIncidencias();
+    } catch (err) {
+      console.error('Error guardando incidencia:', err);
+      await modalAlert('No se pudo guardar el cambio.', { titulo: 'Error' });
+    }
+  }
+
+  // Actualiza solo la fila afectada (y el contador de su agencia) sin
+  // reconstruir el acordeón entero, para no perder el desplegado/scroll.
+  function actualizarFilaIncidencia(tiendaId, tr) {
+    const inc = incidenciaDeTienda(tiendaId, tr?.dataset?.entrega || 'HABITUAL');
+    const motivosActuales = inc?.motivo || [];
+    const marcada = motivosActuales.length > 0;
+    const tipoCalc = calcularTipo(motivosActuales);
+    const esPendiente = marcada && !tipoCalc;
+    const claseFila = claseFilaIncidencia(motivosActuales);
+
+    tr.className = claseFila ? 'con-incidencia ' + claseFila : '';
+    tr.querySelector('.col-estado').textContent = marcada ? '🔴' : '—';
+        const btnBorrarMotivos = tr.querySelector('.btn-borrar-motivos');
+    if (btnBorrarMotivos) btnBorrarMotivos.style.display = marcada ? '' : 'none';
+
+    const badgeTipo = !marcada
+      ? '<span style="color:var(--ink-soft); font-size:12px;">—</span>'
+      : esPendiente
+        ? '<span class="pill pendiente">Pendiente</span>'
+        : `<span class="pill ${tipoCalc.toLowerCase()}">${tipoCalc.charAt(0)+tipoCalc.slice(1).toLowerCase()}</span>`;
+    tr.querySelector('.col-tipo').innerHTML = badgeTipo;
+
+    // Etiqueta del desplegable de motivos (el desplegable en sí se deja abierto
+    // si el usuario lo tenía abierto, para poder seguir marcando varios motivos seguidos).
+    const valorEl = tr.querySelector('.motivo-select-valor');
+    if (valorEl) {
+      valorEl.textContent = resumenMotivos(motivosActuales);
+      valorEl.title = typeof tituloMotivos === 'function' ? tituloMotivos(motivosActuales) : '';
+    }
+
+    const bloque = tr.closest('.agencia-block');
+    if (bloque) {
+      const numInc = bloque.querySelectorAll('tr.con-incidencia').length;
+      const head = bloque.querySelector('.agencia-head');
+      let contEl = head.querySelector('.conteo-inc');
+      if (numInc > 0) {
+        if (!contEl) {
+          contEl = document.createElement('span');
+          contEl.className = 'conteo-inc';
+          head.appendChild(contEl);
+        }
+        contEl.textContent = `${numInc} incidencia${numInc === 1 ? '' : 's'}`;
+      } else if (contEl) {
+        contEl.remove();
+      }
+    }
+  }
+
+  document.getElementById('buscarTiendaIncidencias').addEventListener('input', (e) => {
+    renderAcordeonIncidencias(e.target.value);
+  });
+
+  async function ensureAgenciasYTiendasCargadas() {
+    if (!agenciasCache.length) await cargarAgenciasYTiendas();
+  }
+
+  // (la apertura de "Informe del día" ahora se gestiona en el desplegable "Informes diarios")
+
+  // Arranque: comprobar informe de hoy en cuanto hay sesión
+  // ---------------------------------------------------------------
+  // Motivos de incidencia (lista cerrada) y cálculo automático de TIPO
+  // ---------------------------------------------------------------
+  const MOTIVOS = [
+    { v: 'RETRASO PDTE CONFIRMAR',      clase: 'pendiente' },
+    { v: 'REVISANDO POSIBLE INCIDENCIA', clase: 'pendiente' },
+    { v: 'ROTURA SIN INCIDENCIA',        clase: 'leve' },
+    { v: 'ROTURA ALMACEN',               clase: 'leve' },
+    { v: 'RETRASO LEVE',                 clase: 'leve' },
+    { v: 'PALETS NO RETIRADOS',          clase: 'leve' },
+    { v: 'DESCARGA MANUAL',              clase: 'leve' },
+    { v: 'ROTURA CONFIRMADA',            clase: 'moderado' },
+    { v: 'PALETS SIN VIGILANCIA',        clase: 'moderado' },
+    { v: 'MEZCLAN FECHAS',               clase: 'moderado' },
+    { v: 'PALET REMONTADO',              clase: 'moderado' },
+    { v: 'RETRASO IMPORTANTE',           clase: 'moderado' },
+    { v: 'ADELANTAN ENTREGA',            clase: 'moderado' },
+    { v: 'INCOMPLETO',                   clase: 'moderado' },
+    { v: 'FALTAS',                       clase: 'grave' },
+    { v: 'NO ENTREGAN',                  clase: 'grave' },
+    { v: 'PALET PERDIDO',                clase: 'grave' },
+    { v: 'PALET MANIPULADO',             clase: 'grave' }
+  ];
+
+  // La clasificación Leve/Moderado/Grave de cada motivo ya no está fija
+  // aquí: viene de la tabla `config_gravedad_motivos`, editable en
+  // Configuración → Gravedad de motivos (ver js/config-gravedad-motivos.js,
+  // función nivelDeMotivo()). Si esa caché aún no ha cargado, usa el mismo
+  // respaldo que tenía hardcodeado antes.
+
+  // Calcula el tipo (GRAVE/MODERADO/LEVE/null) a partir de uno o varios motivos.
+  // Si hay varios motivos seleccionados, se queda con el más grave de todos.
+  function calcularTipo(motivos) {
+    const arr = Array.isArray(motivos) ? motivos : (motivos ? [motivos] : []);
+    if (!arr.length) return null;
+    const niveles = arr.map(m => (typeof nivelDeMotivo === 'function' ? nivelDeMotivo(m) : null)).filter(Boolean);
+    if (niveles.includes('grave')) return 'GRAVE';
+    if (niveles.includes('moderado')) return 'MODERADO';
+    if (niveles.includes('leve')) return 'LEVE';
+    return null; // motivos "pendientes" (RETRASO PDTE CONFIRMAR / REVISANDO POSIBLE INCIDENCIA)
+  }
+
+  // Clase de color de la fila de una incidencia. Si entre los motivos
+  // queda alguno "pendiente" (RETRASO PDTE CONFIRMAR / REVISANDO POSIBLE
+  // INCIDENCIA), la fila mantiene el color de pendiente aunque haya otro
+  // motivo con gravedad (p. ej. "+ RETRASO LEVE"), porque sigue sin revisar.
+  function claseFilaIncidencia(motivos) {
+    const arr = motivos || [];
+    if (!arr.length) return '';
+    const tipo = calcularTipo(arr);
+    const pendientes = (typeof MOTIVOS_SIN_REVISAR !== 'undefined') ? MOTIVOS_SIN_REVISAR : ['RETRASO PDTE CONFIRMAR', 'REVISANDO POSIBLE INCIDENCIA'];
+    const hayPendiente = arr.some(m => pendientes.includes(m));
+    if (!tipo) return 'pendiente';
+    return tipo.toLowerCase() + (hayPendiente ? ' pendiente' : '');
+  }
+
+  // Texto corto que se muestra en el botón del desplegable de motivos de cada fila.
+  function resumenMotivos(motivos) {
+  // Los submotivos (p. ej. "ROBO DE CAJAS" dentro de FALTAS) se guardan
+  // como una etiqueta más en el array `motivo` para que viajen con el
+  // resto al guardar, pero no deben verse aquí: solo se muestra el
+  // motivo principal (p. ej. "Faltas").
+  const todosLosSubmotivos = window.SUBMOTIVOS_POR_MOTIVO
+    ? Object.values(window.SUBMOTIVOS_POR_MOTIVO).flat()
+    : [];
+  const arr = (motivos || []).filter(m => !todosLosSubmotivos.includes(m));
+  if (!arr.length) return '— Sin incidencia —';
+  return arr.join(', ');
+}
+
+  // Texto detallado para el tooltip (atributo title) del botón del
+  // desplegable: a diferencia de resumenMotivos(), aquí SÍ se incluye el
+  // submotivo (p. ej. "NO ENTREGAN — ADUANAS"), para verlo al pasar el
+  // ratón por encima sin tener que abrir el desplegable.
+  function tituloMotivos(motivos) {
+    const todosLosSubmotivos = window.SUBMOTIVOS_POR_MOTIVO
+      ? Object.values(window.SUBMOTIVOS_POR_MOTIVO).flat()
+      : [];
+    const arr = motivos || [];
+    const principales = arr.filter(m => !todosLosSubmotivos.includes(m));
+    if (!principales.length) return '';
+    return principales.map(m => {
+      const opciones = (window.SUBMOTIVOS_POR_MOTIVO && window.SUBMOTIVOS_POR_MOTIVO[m]) || [];
+      const submotivo = arr.find(x => opciones.includes(x));
+      return submotivo ? `${m} — ${submotivo}` : m;
+    }).join(', ');
+  }
+
+  // Lista de checkboxes (uno por motivo posible) para el desplegable de cada fila.
+  function motivosChecklistHtml(seleccionados) {
+    const sel = seleccionados || [];
+    return MOTIVOS.map(m => {
+      // Si este motivo tiene submotivos (FALTAS / NO ENTREGAN) y la
+      // incidencia ya trae uno guardado, lo dejamos en un atributo del
+      // propio checkbox — así se puede restaurar el checkbox oculto del
+      // submotivo (ver submotivos-informe.js) sin tener que mostrarlo en
+      // el texto ni depender de cómo pinte cada vista la fila.
+      let atrSubmotivo = '';
+      if (window.SUBMOTIVOS_POR_MOTIVO && window.SUBMOTIVOS_POR_MOTIVO[m.v]) {
+        const guardado = window.SUBMOTIVOS_POR_MOTIVO[m.v].find(op => sel.includes(op));
+        if (guardado) atrSubmotivo = ` data-submotivo-guardado="${escapeHtml(guardado)}"`;
+      }
+      // El color (leve/moderado/grave) sigue la gravedad configurada en
+      // Configuración → Gravedad de motivos; "pendiente" (los 2 motivos
+      // sin gravedad) no cambia nunca.
+      const claseColor = (typeof nivelDeMotivo === 'function' ? nivelDeMotivo(m.v) : null) || m.clase;
+      return `
+      <label class="filtro-check motivo-${claseColor}">
+        <input type="checkbox" class="i-motivo-check" value="${escapeHtml(m.v)}"${atrSubmotivo} ${sel.includes(m.v) ? 'checked' : ''}>
+        <span>${m.v}</span>
+      </label>`;
+    }).join('');
+  }
+
+  // ---------------------------------------------------------------

@@ -1,0 +1,577 @@
+  // Gestión de usuarios
+  // ---------------------------------------------------------------
+  let usuariosCache = [];
+
+  const CLAVES_PERMISOS = [
+    'informe_dia', 'enviar_informe', 'editar_informes_pasados',
+    'panel_siniestros', 'siniestros_dia', 'enviar_facturacion',
+    'config_tiendas', 'config_pruebas', 'config_limites', 'config_emails', 'config_facturacion', 'config_cc_transporte',
+    'config_gravedad_motivos',
+    'gestion_usuarios', 'borrar', 'enviar_reporte_mensual', 'ver_auditoria',
+    'ver_log_cambios_informes'
+  ];
+
+  // Iconos de las acciones de cada fila (Editar / Desactivar-Activar / Borrar).
+  const USR_ICO = {
+    editar: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>',
+    desactivar: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M17 8l5 5M22 8l-5 5"/></svg>',
+    activar: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M16 11l2 2 4-4"/></svg>',
+    borrar: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>'
+  };
+
+  async function cargarUsuarios() {
+    const tbody = document.getElementById('tablaUsuariosBody');
+    mostrarCargandoGlobal();
+    try {
+      const { data, error } = await sb
+        .from('usuarios')
+        .select('id, nombre, usuario, rol, activo, ultima_conexion, permisos')
+        .order('nombre', { ascending: true });
+      if (error) throw error;
+
+      usuariosCache = data || [];
+
+      if (!usuariosCache.length) {
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding:30px; color:var(--ink-soft);">No hay usuarios todavía.</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = usuariosCache.map(u => `
+        <tr>
+          <td><b>${escapeHtml(u.nombre)}</b></td>
+          <td>${escapeHtml(u.usuario)}</td>
+          <td><span class="badge-rol ${u.rol}">${u.rol}</span></td>
+          <td>${u.ultima_conexion ? formatearFechaHoraCorta(new Date(u.ultima_conexion)) : '—'}</td>
+          <td>
+            <span class="badge-estado ${u.activo ? 'activo' : 'inactivo'}">
+              <i></i>${u.activo ? 'Activo' : 'Desactivado'}
+            </span>
+          </td>
+          <td style="text-align:right; white-space:nowrap;">
+            <div class="usr-acciones">
+              <button type="button" class="usr-ico editar" data-editar="${u.id}" title="Editar" aria-label="Editar">${USR_ICO.editar}</button>
+              <button type="button" class="usr-ico ${u.activo ? 'desactivar' : 'activar'}" data-toggle="${u.id}" data-activo="${u.activo}" title="${u.activo ? 'Desactivar' : 'Activar'}" aria-label="${u.activo ? 'Desactivar' : 'Activar'}">${u.activo ? USR_ICO.desactivar : USR_ICO.activar}</button>
+              <button type="button" class="usr-ico borrar" data-borrar="${u.id}" title="Borrar" aria-label="Borrar">${USR_ICO.borrar}</button>
+            </div>
+          </td>
+        </tr>
+      `).join('');
+
+      tbody.querySelectorAll('[data-editar]').forEach(btn => {
+        btn.addEventListener('click', () => abrirModalEditarUsuario(btn.dataset.editar));
+      });
+      tbody.querySelectorAll('[data-borrar]').forEach(btn => {
+        btn.addEventListener('click', () => borrarUsuario(btn.dataset.borrar));
+      });
+      tbody.querySelectorAll('[data-toggle]').forEach(btn => {
+        btn.addEventListener('click', () => toggleUsuario(btn.dataset.toggle, btn.dataset.activo === 'true'));
+      });
+    } catch (err) {
+      console.error('Error cargando usuarios:', err);
+      tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding:30px; color:var(--grave);">Error al cargar usuarios.</td></tr>';
+    } finally {
+      ocultarCargandoGlobal();
+    }
+  }
+
+  function escapeHtml(str) {
+    return String(str ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  async function toggleUsuario(id, activoActual) {
+    const nuevoEstado = !activoActual;
+    const ok = await modalConfirm(
+      nuevoEstado ? '¿Activar este usuario?' : '¿Desactivar este usuario? No podrá iniciar sesión.',
+      { titulo: nuevoEstado ? 'Activar usuario' : 'Desactivar usuario', danger: !nuevoEstado }
+    );
+    if (!ok) return;
+    try {
+      const { error } = await sb.from('usuarios').update({ activo: nuevoEstado }).eq('id', id);
+      if (error) throw error;
+      const u = usuariosCache.find(x => String(x.id) === String(id));
+      if (typeof registrarAccion === 'function') registrarAccion('usuarios', nuevoEstado ? 'Activar usuario' : 'Desactivar usuario', u?.nombre || '');
+      cargarUsuarios();
+    } catch (err) {
+      console.error('Error cambiando estado de usuario:', err);
+      await modalAlert('No se pudo actualizar el usuario.', { titulo: 'Error' });
+    }
+  }
+
+  // ---------------- Selector de rol (botones) + panel de permisos ----------------
+
+  // prefijo: 'nu' (nuevo) o 'eu' (editar)
+  function engancharSelectorRol(prefijo) {
+    const toggle = document.getElementById(`${prefijo}RolToggle`);
+    const hidden = document.getElementById(`${prefijo}Rol`);
+    const panel = document.getElementById(`${prefijo}PermisosPanel`);
+    if (!toggle) return;
+
+    toggle.querySelectorAll('.toggle-seg-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        toggle.querySelectorAll('.toggle-seg-btn').forEach(b => b.classList.remove('activo'));
+        btn.classList.add('activo');
+        hidden.value = btn.dataset.rol;
+        panel.style.display = btn.dataset.rol === 'operador' ? '' : 'none';
+      });
+    });
+  }
+  engancharSelectorRol('nu');
+  engancharSelectorRol('eu');
+
+  function fijarRolEnFormulario(prefijo, rol) {
+    const toggle = document.getElementById(`${prefijo}RolToggle`);
+    const hidden = document.getElementById(`${prefijo}Rol`);
+    const panel = document.getElementById(`${prefijo}PermisosPanel`);
+    hidden.value = rol || 'operador';
+    toggle.querySelectorAll('.toggle-seg-btn').forEach(b => b.classList.toggle('activo', b.dataset.rol === hidden.value));
+    panel.style.display = hidden.value === 'operador' ? '' : 'none';
+  }
+
+  function leerPermisosDeFormulario(prefijo) {
+    const permisos = {};
+    CLAVES_PERMISOS.forEach(clave => {
+      const el = document.getElementById(`${prefijo}Perm_${clave}`);
+      if (!el) return;
+      // "Configurar pruebas" / "Configurar límite palets…" forzados por
+      // "Tiendas y agencias": se guarda su valor propio (el que tenía
+      // antes), no el forzado.
+      if (el.dataset.propio != null) permisos[clave] = el.dataset.propio === '1';
+      else permisos[clave] = el.checked;
+    });
+    return permisos;
+  }
+
+  // "Tiendas y agencias" incluye "Configurar pruebas" y "Configurar límite
+  // palets y límites especiales": con la primera marcada, las otras salen
+  // marcadas y bloqueadas. Al quitar Tiendas y agencias, vuelven a como
+  // estaban antes.
+  const PERMISOS_INCLUIDOS_EN_TIENDAS = ['config_pruebas', 'config_limites'];
+  function sincronizarPruebasConTiendas(prefijo) {
+    const chkT = document.getElementById(`${prefijo}Perm_config_tiendas`);
+    if (!chkT) return;
+    PERMISOS_INCLUIDOS_EN_TIENDAS.forEach(clave => {
+      const chkP = document.getElementById(`${prefijo}Perm_${clave}`);
+      if (!chkP) return;
+      const label = chkP.closest('.permiso-item');
+      if (chkT.checked) {
+        if (chkP.dataset.propio == null) chkP.dataset.propio = chkP.checked ? '1' : '0';
+        chkP.checked = true;
+        label?.classList.add('permiso-incluido');
+        if (label) label.title = 'Incluido en «Tiendas». Para quitarlo, quita primero ese permiso.';
+      } else {
+        if (chkP.dataset.propio != null) chkP.checked = chkP.dataset.propio === '1';
+        delete chkP.dataset.propio;
+        label?.classList.remove('permiso-incluido');
+        if (label) label.title = '';
+      }
+    });
+  }
+  ['eu', 'nu'].forEach(prefijo => {
+    document.getElementById(`${prefijo}Perm_config_tiendas`)?.addEventListener('change', () => sincronizarPruebasConTiendas(prefijo));
+    // Con Tiendas y agencias marcado, estos checks se ven normales (en
+    // color) pero no se pueden quitar.
+    PERMISOS_INCLUIDOS_EN_TIENDAS.forEach(clave => {
+      document.getElementById(`${prefijo}Perm_${clave}`)?.addEventListener('click', (e) => {
+        if (document.getElementById(`${prefijo}Perm_config_tiendas`)?.checked) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+        }
+      });
+    });
+  });
+
+  // Nombre legible de un permiso, sacado de la etiqueta del propio
+  // formulario (así no hay que mantener dos listas de nombres).
+  function etiquetaPermiso(clave) {
+    const el = document.getElementById(`euPerm_${clave}`);
+    const b = el?.closest('label')?.querySelector('b');
+    return (b?.textContent || clave).trim();
+  }
+
+  // Lista de cambios de un usuario para el registro de auditoría (lupa):
+  // datos básicos, PIN (sin mostrar nunca su valor) y permisos añadidos
+  // o quitados.
+  function cambiosAuditoriaUsuario(antes, despues, pinCambiado) {
+    if (typeof auditoriaCalcularCambios !== 'function') return null;
+    const rolTexto = r => (r === 'admin' ? 'Admin' : r === 'operador' ? 'Operador' : r === 'lectura' ? 'Lectura' : r);
+    const cambios = auditoriaCalcularCambios([
+      { clave: 'nombre', etiqueta: 'Nombre' },
+      { clave: 'usuario', etiqueta: 'Usuario' },
+      { clave: 'rol', etiqueta: 'Rol', formato: rolTexto },
+      { clave: 'activo', etiqueta: 'Activo', formato: v => (v === false ? 'No' : 'Sí') }
+    ], antes, despues);
+    if (pinCambiado) cambios.push({ campo: 'PIN', antes: '••••', despues: 'PIN cambiado' });
+
+    // Permisos: solo tienen sentido para operadores (el administrador
+    // lo puede todo), así que solo se comparan si queda como operador.
+    if (despues.rol === 'operador') {
+      const permAntes = antes && antes.rol === 'operador' ? (antes.permisos || {}) : {};
+      const permDespues = despues.permisos || {};
+      CLAVES_PERMISOS.forEach(clave => {
+        const a = !!permAntes[clave];
+        const d = !!permDespues[clave];
+        if (a !== d) {
+          cambios.push({
+            campo: `Permiso: ${etiquetaPermiso(clave)}`,
+            antes: a ? 'Sí' : 'No',
+            despues: d ? 'Sí (añadido)' : 'No (quitado)'
+          });
+        }
+      });
+    }
+    return cambios;
+  }
+
+  function fijarPermisosEnFormulario(prefijo, permisos) {
+    PERMISOS_INCLUIDOS_EN_TIENDAS.forEach(clave => {
+      const chkP = document.getElementById(`${prefijo}Perm_${clave}`);
+      if (chkP) delete chkP.dataset.propio;
+    });
+    CLAVES_PERMISOS.forEach(clave => {
+      const el = document.getElementById(`${prefijo}Perm_${clave}`);
+      if (el) el.checked = !!(permisos && permisos[clave]);
+    });
+    sincronizarPruebasConTiendas(prefijo);
+  }
+
+  // Permisos a guardar: los del panel solo cuentan para operadores (admin
+  // lo puede todo, lectura no puede nada).
+  // "Usuario externo" (entrar desde fuera del centro de trabajo) ya no se
+  // toca desde la app: es la columna usuarios.usuario_externo, que solo se
+  // cambia desde Supabase (un trigger impide cambiarla desde la app). La
+  // lee la Edge Function gidt-login.
+  function permisosAGuardar(prefijo, rol) {
+    return rol === 'operador' ? leerPermisosDeFormulario(prefijo) : {};
+  }
+
+  // ---------------- Botón Guardar de los modales de usuario ----------------
+  // Igual que en el detalle del siniestro: Guardar arriba, apagado mientras
+  // no haya nada que guardar. En Editar se compara con cómo estaba al abrir;
+  // en Nuevo, se enciende al rellenar nombre, usuario y PIN.
+  const baseFormUsuario = { eu: null };
+
+  function fotoFormularioUsuario(prefijo) {
+    const valor = id => (document.getElementById(id)?.value || '').trim();
+    return JSON.stringify({
+      nombre: valor(`${prefijo}Nombre`),
+      usuario: valor(`${prefijo}Usuario`),
+      pin: valor(`${prefijo}Pin`),
+      rol: valor(`${prefijo}Rol`),
+      activo: !!document.getElementById(`${prefijo}Activo`)?.checked,
+      permisos: leerPermisosDeFormulario(prefijo)
+    });
+  }
+
+  function formularioUsuarioListo(prefijo) {
+    if (prefijo === 'eu') return !!baseFormUsuario.eu && fotoFormularioUsuario('eu') !== baseFormUsuario.eu;
+    return ['nuNombre', 'nuUsuario', 'nuPin'].every(id => document.getElementById(id).value.trim());
+  }
+
+  function actualizarBotonGuardarUsuario(prefijo) {
+    const btn = document.getElementById(prefijo === 'eu' ? 'btnGuardarEditarUsuario' : 'btnGuardarUsuario');
+    if (!btn || btn.classList.contains('guardando')) return;
+    const listo = formularioUsuarioListo(prefijo);
+    btn.disabled = !listo;
+    btn.classList.toggle('sin-cambios', !listo);
+    const sub = document.getElementById(`${prefijo}Sub`);
+    if (sub) {
+      sub.textContent = prefijo === 'eu'
+        ? (listo ? 'Hay cambios sin guardar.' : 'Modifica los datos y pulsa Guardar.')
+        : 'Rellena nombre, usuario y PIN, marca sus permisos y pulsa Guardar.';
+    }
+  }
+
+  // ¿Hay algo escrito/cambiado que se perdería al cerrar?
+  function hayCambiosSinGuardarUsuario(prefijo) {
+    if (prefijo === 'eu') return formularioUsuarioListo('eu');
+    const vacio = fotoFormularioUsuario('nu');
+    return !!baseFormUsuario.nu && vacio !== baseFormUsuario.nu;
+  }
+
+  async function cerrarModalUsuarioConAviso(prefijo, cerrar) {
+    if (hayCambiosSinGuardarUsuario(prefijo)) {
+      const ok = await modalConfirm('Tienes cambios sin guardar. ¿Descartarlos?', { titulo: 'Descartar cambios', danger: true, textoOk: 'Descartar' });
+      if (!ok) return;
+    }
+    cerrar();
+  }
+
+  // Cualquier cambio dentro del modal (escribir, marcar, elegir rol)
+  // vuelve a comprobar el botón. El rol se cambia con un clic en el
+  // selector, por eso también se escucha "click" (después de aplicarse).
+  [['eu', 'editarUsuarioModalOverlay'], ['nu', 'nuevoUsuarioModalOverlay']].forEach(([prefijo, idOverlay]) => {
+    const overlay = document.getElementById(idOverlay);
+    if (!overlay) return;
+    ['input', 'change', 'click'].forEach(ev => overlay.addEventListener(ev, () => setTimeout(() => actualizarBotonGuardarUsuario(prefijo), 0)));
+  });
+
+  // ---------------- Nuevo usuario ----------------
+
+  function abrirModalNuevoUsuario() {
+    document.getElementById('nuNombre').value = '';
+    document.getElementById('nuUsuario').value = '';
+    document.getElementById('nuPin').value = '';
+    fijarRolEnFormulario('nu', 'operador');
+    fijarPermisosEnFormulario('nu', {});
+    document.getElementById('nuError').style.display = 'none';
+    baseFormUsuario.nu = fotoFormularioUsuario('nu');
+    actualizarBotonGuardarUsuario('nu');
+    document.getElementById('nuevoUsuarioModalOverlay').classList.add('show');
+  }
+
+  function cerrarModalNuevoUsuario() {
+    document.getElementById('nuevoUsuarioModalOverlay').classList.remove('show');
+  }
+
+  document.getElementById('btnNuevoUsuario').addEventListener('click', abrirModalNuevoUsuario);
+  document.getElementById('btnCerrarNuevoUsuario').addEventListener('click', () => cerrarModalUsuarioConAviso('nu', cerrarModalNuevoUsuario));
+
+  document.getElementById('btnGuardarUsuario').addEventListener('click', async () => {
+    const nombre = document.getElementById('nuNombre').value.trim();
+    const usuario = document.getElementById('nuUsuario').value.trim();
+    const pin = document.getElementById('nuPin').value.trim();
+    const rol = document.getElementById('nuRol').value;
+    const errEl = document.getElementById('nuError');
+    const btn = document.getElementById('btnGuardarUsuario');
+    errEl.style.display = 'none';
+
+    if (!nombre || !usuario || !pin) {
+      errEl.textContent = 'Rellena nombre, usuario y PIN.';
+      errEl.style.display = 'block';
+      return;
+    }
+    if (pin.length < 4) {
+      errEl.textContent = 'El PIN debe tener al menos 4 dígitos.';
+      errEl.style.display = 'block';
+      return;
+    }
+
+    btn.disabled = true;
+    btn.classList.add('guardando');
+
+    try {
+      const pinHash = await sha256(pin);
+      const permisos = permisosAGuardar('nu', rol);
+      const { error } = await sb.from('usuarios').insert({
+        nombre, usuario, pin_hash: pinHash, rol, permisos
+      });
+      if (error) {
+        if (error.code === '23505') throw new Error('Ese nombre de usuario ya existe.');
+        throw error;
+      }
+      if (typeof registrarAccion === 'function') registrarAccion('usuarios', 'Crear usuario', `${nombre} (${rol})`);
+
+      cerrarModalNuevoUsuario();
+      cargarUsuarios();
+    } catch (err) {
+      console.error('Error creando usuario:', err);
+      errEl.textContent = err.message || 'No se pudo crear el usuario.';
+      errEl.style.display = 'block';
+    } finally {
+      btn.classList.remove('guardando');
+      actualizarBotonGuardarUsuario('nu');
+    }
+  });
+
+  // ---------------- Editar usuario ----------------
+
+  let usuarioEditandoId = null;
+
+  function abrirModalEditarUsuario(id) {
+    const u = usuariosCache.find(x => String(x.id) === String(id));
+    if (!u) return;
+    usuarioEditandoId = id;
+
+    document.getElementById('euNombre').value = u.nombre || '';
+    document.getElementById('euUsuario').value = u.usuario || '';
+    document.getElementById('euPin').value = '';
+    document.getElementById('euActivo').checked = !!u.activo;
+    fijarRolEnFormulario('eu', u.rol || 'operador');
+    fijarPermisosEnFormulario('eu', u.permisos || {});
+    document.getElementById('euError').style.display = 'none';
+    baseFormUsuario.eu = fotoFormularioUsuario('eu');
+    actualizarBotonGuardarUsuario('eu');
+
+    document.getElementById('editarUsuarioModalOverlay').classList.add('show');
+  }
+
+  function cerrarModalEditarUsuario() {
+    document.getElementById('editarUsuarioModalOverlay').classList.remove('show');
+    usuarioEditandoId = null;
+    baseFormUsuario.eu = null;
+  }
+
+  async function guardarEdicionUsuario() {
+    if (!usuarioEditandoId) return;
+    const nombre = document.getElementById('euNombre').value.trim();
+    const usuario = document.getElementById('euUsuario').value.trim();
+    const rol = document.getElementById('euRol').value;
+    const activo = document.getElementById('euActivo').checked;
+    const pin = document.getElementById('euPin').value.trim();
+    const errEl = document.getElementById('euError');
+    errEl.style.display = 'none';
+
+    if (!nombre || !usuario) {
+      errEl.textContent = 'Rellena al menos el nombre y el usuario.';
+      errEl.style.display = 'block';
+      return;
+    }
+    if (pin && pin.length < 4) {
+      errEl.textContent = 'El PIN debe tener al menos 4 dígitos.';
+      errEl.style.display = 'block';
+      return;
+    }
+
+    const btn = document.getElementById('btnGuardarEditarUsuario');
+    btn.disabled = true;
+    try {
+      const cambios = {
+        nombre, usuario, rol, activo,
+        permisos: permisosAGuardar('eu', rol)
+      };
+      if (pin) cambios.pin_hash = await sha256(pin);
+
+      // El id llega del data-editar del botón (texto) y en la caché es un
+      // número: se comparan como texto, si no nunca se encontraba el
+      // usuario "antes" y la auditoría marcaba todos los campos como nuevos.
+      const usuarioAntes = usuariosCache.find(x => String(x.id) === String(usuarioEditandoId));
+      const { error } = await sb.from('usuarios').update(cambios).eq('id', usuarioEditandoId);
+      if (error) {
+        if (error.code === '23505') throw new Error('Ese nombre de usuario ya existe.');
+        throw error;
+      }
+      if (typeof registrarAccion === 'function') {
+        registrarAccion('usuarios', 'Editar usuario', `${nombre} (${rol})`, cambiosAuditoriaUsuario(usuarioAntes, cambios, !!pin));
+      }
+
+      cerrarModalEditarUsuario();
+      cargarUsuarios();
+    } catch (err) {
+      console.error('Error editando usuario:', err);
+      errEl.textContent = err.message || 'No se pudo guardar el usuario.';
+      errEl.style.display = 'block';
+    } finally {
+      actualizarBotonGuardarUsuario('eu');
+    }
+  }
+
+  document.getElementById('btnCerrarEditarUsuario')?.addEventListener('click', () => cerrarModalUsuarioConAviso('eu', cerrarModalEditarUsuario));
+  document.getElementById('btnGuardarEditarUsuario')?.addEventListener('click', guardarEdicionUsuario);
+
+  // ---------------- Borrar usuario ----------------
+
+  async function borrarUsuario(id) {
+    const u = usuariosCache.find(x => String(x.id) === String(id));
+    const ok = await modalConfirm(
+      `¿Borrar definitivamente a ${u ? u.nombre : 'este usuario'}? Esta acción no se puede deshacer.`,
+      { titulo: 'Borrar usuario', danger: true, textoOk: 'Borrar' }
+    );
+    if (!ok) return;
+    try {
+      const { error } = await sb.from('usuarios').delete().eq('id', id);
+      if (error) throw error;
+      if (typeof registrarAccion === 'function') registrarAccion('usuarios', 'Borrar usuario', u ? u.nombre : '');
+      cargarUsuarios();
+    } catch (err) {
+      console.error('Error borrando usuario:', err);
+      await modalAlert('No se pudo borrar el usuario.', { titulo: 'Error' });
+    }
+  }
+
+  // Recargar la tabla SIEMPRE al entrar en la pestaña Usuarios, para ver
+  // los cambios hechos por otros compañeros sin reiniciar la app.
+  document.querySelectorAll('[data-view="config-usuarios"]').forEach(el => {
+    el.addEventListener('click', () => { cargarUsuarios(); });
+  });
+  document.getElementById('btnRecargarUsuarios')?.addEventListener('click', (e) =>
+    recargarConGiro(e.currentTarget, cargarUsuarios));
+
+  // ---------------------------------------------------------------
+
+
+  // ---------------- Mi usuario (cabecera) ----------------
+  // Al pulsar el número de usuario de la cabecera (igual que en SALIDAS):
+  // datos de la sesión en solo lectura y cambio de la propia contraseña
+  // (PIN), pidiendo la actual.
+
+  function abrirModalMiUsuario() {
+    const s = getSesion();
+    if (!s) return;
+    const nombresRol = { admin: 'Administrador', operador: 'Operador', lectura: 'Lectura' };
+    document.getElementById('muNombre').value = s.nombre || '';
+    document.getElementById('muUsuario').value = s.usuario || '';
+    document.getElementById('muRol').value = nombresRol[s.rol] || s.rol || '';
+
+    // Las etiquetas de los permisos se sacan del formulario de "Editar
+    // usuario", así no hay que mantener otra lista con los mismos textos.
+    const cont = document.getElementById('muPermisos');
+    if (s.rol === 'admin') {
+      cont.innerHTML = '<span class="mu-pill">Acceso a todo (Administrador)</span>';
+    } else {
+      const permisos = s.permisos || {};
+      const etiquetas = CLAVES_PERMISOS.filter(c => permisos[c]).map(c => {
+        const b = document.getElementById('euPerm_' + c)?.closest('label')?.querySelector('b');
+        return b ? b.textContent.trim() : c;
+      });
+      cont.innerHTML = etiquetas.length
+        ? etiquetas.map(e => `<span class="mu-pill">${escapeHtml(e)}</span>`).join('')
+        : '<span class="mu-vacio">Sin permisos adicionales asignados.</span>';
+    }
+
+    ['muPinActual', 'muPinNuevo', 'muPinRepetir'].forEach(id => { document.getElementById(id).value = ''; });
+    document.getElementById('muError').style.display = 'none';
+    document.getElementById('btnGuardarMiUsuario').disabled = false;
+    document.getElementById('miUsuarioModalOverlay').classList.add('show');
+  }
+
+  function cerrarModalMiUsuario() {
+    document.getElementById('miUsuarioModalOverlay').classList.remove('show');
+  }
+
+  async function guardarMiPin() {
+    const s = getSesion();
+    if (!s) return;
+    const actual = document.getElementById('muPinActual').value.trim();
+    const nuevo = document.getElementById('muPinNuevo').value.trim();
+    const repetir = document.getElementById('muPinRepetir').value.trim();
+    const errEl = document.getElementById('muError');
+    const fallo = (msg, idFoco) => {
+      errEl.textContent = msg;
+      errEl.style.display = 'block';
+      if (idFoco) document.getElementById(idFoco).focus();
+    };
+    errEl.style.display = 'none';
+
+    if (!actual) return fallo('Escribe tu contraseña actual.', 'muPinActual');
+    if (!nuevo || nuevo.length < 4) return fallo('La contraseña nueva debe tener al menos 4 dígitos.', 'muPinNuevo');
+    if (nuevo !== repetir) return fallo('Las dos contraseñas nuevas no coinciden.', 'muPinRepetir');
+    if (nuevo === actual) return fallo('La contraseña nueva es igual que la actual.', 'muPinNuevo');
+
+    const btn = document.getElementById('btnGuardarMiUsuario');
+    btn.disabled = true;
+    try {
+      const { data, error } = await sb.from('usuarios').select('pin_hash').eq('id', s.id).maybeSingle();
+      if (error) throw error;
+      if (!data || data.pin_hash !== await sha256(actual)) {
+        return fallo('La contraseña actual no es correcta.', 'muPinActual');
+      }
+      const { error: errUpd } = await sb.from('usuarios').update({ pin_hash: await sha256(nuevo) }).eq('id', s.id);
+      if (errUpd) throw errUpd;
+      if (typeof registrarAccion === 'function') {
+        registrarAccion('usuarios', 'Cambiar su contraseña', s.nombre || s.usuario);
+      }
+      cerrarModalMiUsuario();
+      mostrarToast('Contraseña actualizada');
+    } catch (err) {
+      console.error('Error cambiando la contraseña:', err);
+      fallo(err.message || 'No se pudo cambiar la contraseña.');
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  document.getElementById('userChipUsuario')?.addEventListener('click', abrirModalMiUsuario);
+  document.getElementById('btnCerrarMiUsuario')?.addEventListener('click', cerrarModalMiUsuario);
+  document.getElementById('btnCancelarMiUsuario')?.addEventListener('click', cerrarModalMiUsuario);
+  document.getElementById('btnGuardarMiUsuario')?.addEventListener('click', guardarMiPin);
+  document.getElementById('muPinRepetir')?.addEventListener('keydown', e => { if (e.key === 'Enter') guardarMiPin(); });

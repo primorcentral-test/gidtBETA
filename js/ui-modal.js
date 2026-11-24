@@ -1,0 +1,273 @@
+// ---------------------------------------------------------------
+  // Modal genérico (sustituye alert / confirm / prompt nativos)
+  // ---------------------------------------------------------------
+  const modalOverlay   = document.getElementById('modalOverlay');
+  const modalIconEl    = document.getElementById('modalIcon');
+  const modalTitleEl   = document.getElementById('modalTitle');
+  const modalMessageEl = document.getElementById('modalMessage');
+  const modalInputEl   = document.getElementById('modalInput');
+  const modalBtnOk     = document.getElementById('modalBtnOk');
+  const modalBtnCancel = document.getElementById('modalBtnCancel');
+
+  // Se mueve al final del <body> antes de abrirlo: así queda siempre por
+  // encima de cualquier otra ventana abierta (p. ej. "Enviando correo…"),
+  // y un aviso de error nunca se queda tapado sin poder pulsar Aceptar.
+  function _abrirModal() {
+    if (modalOverlay.parentNode && modalOverlay !== document.body.lastElementChild) document.body.appendChild(modalOverlay);
+    modalOverlay.classList.add('show');
+  }
+  function _cerrarModal() { modalOverlay.classList.remove('show'); }
+
+  // Cuando es true, clicar fuera del cuadro NO cierra el modal (se usa
+  // para pasos obligatorios, p. ej. precisar el submotivo de FALTAS/NO
+  // ENTREGAN, donde no tiene sentido poder descartarlo sin querer).
+  let modalBloqueaClicFuera = false;
+
+  function modalAlert(mensaje, { titulo = 'Aviso', icono = '', danger = false, textoOk = 'Aceptar' } = {}) {
+    // Justo después de "Cancelar consulta" (js/carga-global.js), las cargas
+    // cortadas acaban en su catch y querrían avisar de un error: se omite.
+    if (typeof consultaRecienCancelada === 'function' && consultaRecienCancelada()
+        && /error|no se pud|no se ha podido|fall/i.test(`${titulo} ${mensaje}`)) {
+      return Promise.resolve();
+    }
+    return new Promise(resolve => {
+      modalIconEl.style.display = icono ? '' : 'none';
+      modalIconEl.textContent = icono;
+      modalTitleEl.textContent = titulo;
+      modalTitleEl.classList.toggle('modal-title-danger', danger);
+      // Con danger: cuadro con franja roja arriba, para que se vea bien.
+      modalOverlay.querySelector('.modal-box')?.classList.toggle('modal-box-danger', danger);
+      modalMessageEl.textContent = mensaje;
+      modalInputEl.style.display = 'none';
+      modalBtnCancel.style.display = 'none';
+      modalBtnOk.textContent = textoOk;
+      modalBtnOk.className = danger ? 'btn danger' : 'btn primary';
+      _abrirModal();
+
+      const onOk = () => { limpiar(); resolve(); };
+      function limpiar() {
+        _cerrarModal();
+        modalTitleEl.classList.remove('modal-title-danger');
+        modalOverlay.querySelector('.modal-box')?.classList.remove('modal-box-danger');
+        modalBtnOk.removeEventListener('click', onOk);
+      }
+      modalBtnOk.addEventListener('click', onOk);
+    });
+  }
+
+  function modalConfirm(mensaje, { titulo = 'Confirmar', danger = false, textoOk = 'Aceptar', textoCancel = 'Cancelar', icono = '' } = {}) {
+    return new Promise(resolve => {
+      modalIconEl.style.display = icono ? '' : 'none';
+      modalIconEl.textContent = icono;
+      modalTitleEl.textContent = titulo;
+      // Con danger (eliminar, quitar, anular…): el mismo cuadro rojo que modalAlert.
+      modalTitleEl.classList.toggle('modal-title-danger', danger);
+      modalOverlay.querySelector('.modal-box')?.classList.toggle('modal-box-danger', danger);
+      modalMessageEl.textContent = mensaje;
+      modalInputEl.style.display = 'none';
+      modalBtnCancel.style.display = '';
+      modalBtnCancel.textContent = textoCancel;
+      modalBtnOk.textContent = textoOk;
+      modalBtnOk.className = danger ? 'btn danger' : 'btn primary';
+      _abrirModal();
+
+      const onOk = () => { limpiar(); resolve(true); };
+      const onCancel = () => { limpiar(); resolve(false); };
+      function limpiar() {
+        _cerrarModal();
+        modalTitleEl.classList.remove('modal-title-danger');
+        modalOverlay.querySelector('.modal-box')?.classList.remove('modal-box-danger');
+        modalBtnOk.removeEventListener('click', onOk);
+        modalBtnCancel.removeEventListener('click', onCancel);
+      }
+      modalBtnOk.addEventListener('click', onOk);
+      modalBtnCancel.addEventListener('click', onCancel);
+    });
+  }
+
+  // Como modalConfirm, pero con casillas debajo del mensaje para elegir qué
+  // más hacer (p. ej. al anular un siniestro: "Avisar a la agencia" y
+  // "Quitar los motivos del informe").
+  //   opciones: [{ id, titulo, detalle, marcada = true }]
+  // Devuelve null si se cancela, o un objeto { [id]: true/false } si se acepta.
+  function modalConfirmOpciones(mensaje, opciones = [], { titulo = 'Confirmar', danger = false, textoOk = 'Aceptar', textoCancel = 'Cancelar', icono = '' } = {}) {
+    return new Promise(resolve => {
+      modalIconEl.style.display = icono ? '' : 'none';
+      modalIconEl.textContent = icono;
+      modalTitleEl.textContent = titulo;
+      modalTitleEl.classList.toggle('modal-title-danger', danger);
+      modalOverlay.querySelector('.modal-box')?.classList.toggle('modal-box-danger', danger);
+      modalMessageEl.textContent = mensaje;
+      modalInputEl.style.display = 'none';
+      modalBtnCancel.style.display = '';
+      modalBtnCancel.textContent = textoCancel;
+      modalBtnOk.textContent = textoOk;
+      modalBtnOk.className = danger ? 'btn danger' : 'btn primary';
+
+      const lista = document.createElement('div');
+      lista.className = 'modal-opciones' + (danger ? ' danger' : '');
+      lista.innerHTML = opciones.map(o => `
+        <label class="modal-opcion">
+          <input type="checkbox" data-opcion="${escapeHtml(o.id)}" ${o.marcada === false ? '' : 'checked'}>
+          <span><b>${escapeHtml(o.titulo)}</b>${o.detalle ? `<small>${escapeHtml(o.detalle)}</small>` : ''}</span>
+        </label>`).join('');
+      if (opciones.length) modalMessageEl.after(lista);
+      _abrirModal();
+
+      const onOk = () => {
+        const res = {};
+        lista.querySelectorAll('[data-opcion]').forEach(cb => { res[cb.dataset.opcion] = cb.checked; });
+        limpiar();
+        resolve(res);
+      };
+      const onCancel = () => { limpiar(); resolve(null); };
+      function limpiar() {
+        _cerrarModal();
+        lista.remove();
+        modalTitleEl.classList.remove('modal-title-danger');
+        modalOverlay.querySelector('.modal-box')?.classList.remove('modal-box-danger');
+        modalBtnOk.removeEventListener('click', onOk);
+        modalBtnCancel.removeEventListener('click', onCancel);
+      }
+      modalBtnOk.addEventListener('click', onOk);
+      modalBtnCancel.addEventListener('click', onCancel);
+    });
+  }
+
+  function modalPrompt(mensaje, { titulo = 'Introduce un valor', placeholder = '', valorInicial = '', tipo = 'text' } = {}) {
+    return new Promise(resolve => {
+      modalIconEl.style.display = 'none';
+      modalTitleEl.textContent = titulo;
+      modalMessageEl.textContent = mensaje;
+      modalInputEl.style.display = '';
+      modalInputEl.type = tipo;
+      modalInputEl.placeholder = placeholder;
+      modalInputEl.value = valorInicial;
+      modalBtnCancel.style.display = '';
+      modalBtnCancel.textContent = 'Cancelar';
+      modalBtnOk.textContent = 'Aceptar';
+      modalBtnOk.className = 'btn primary';
+      _abrirModal();
+      setTimeout(() => modalInputEl.focus(), 30);
+
+      const onOk = () => { const v = modalInputEl.value; limpiar(); resolve(v); };
+      const onCancel = () => { limpiar(); resolve(null); };
+      const onKey = (e) => {
+        if (e.key === 'Enter') onOk();
+        if (e.key === 'Escape') onCancel();
+      };
+      function limpiar() {
+        _cerrarModal();
+        modalBtnOk.removeEventListener('click', onOk);
+        modalBtnCancel.removeEventListener('click', onCancel);
+        modalInputEl.removeEventListener('keydown', onKey);
+      }
+      modalBtnOk.addEventListener('click', onOk);
+      modalBtnCancel.addEventListener('click', onCancel);
+      modalInputEl.addEventListener('keydown', onKey);
+    });
+  }
+
+  function modalSeleccionar(mensaje, opciones, { titulo = 'Seleccionar', textoOk = 'Aceptar', valorInicial = null, bloquearClicFuera = false } = {}) {
+    return new Promise(resolve => {
+      const modalSelectEl = document.getElementById('modalSelect');
+      modalIconEl.style.display = 'none';
+      modalTitleEl.textContent = titulo;
+      modalMessageEl.textContent = mensaje;
+      modalInputEl.style.display = 'none';
+      modalSelectEl.innerHTML = opciones.map(o =>
+        `<option value="${o.id}" ${valorInicial === o.id ? 'selected' : ''}>${o.nombre}</option>`
+      ).join('');
+      modalSelectEl.style.display = '';
+      modalBtnCancel.style.display = '';
+      modalBtnCancel.textContent = 'Cancelar';
+      modalBtnOk.textContent = textoOk;
+      modalBtnOk.className = 'btn primary';
+      modalBloqueaClicFuera = bloquearClicFuera;
+      _abrirModal();
+
+      // Convierte a número solo si el valor es numérico (p.ej. IDs de
+      // agencia); si es texto (p.ej. "leve"/"moderado"/"grave"), se
+      // devuelve tal cual.
+      const onOk = () => {
+        const raw = modalSelectEl.value;
+        const v = /^-?\d+$/.test(raw) ? Number(raw) : raw;
+        limpiar(); resolve(v);
+      };
+      const onCancel = () => { limpiar(); resolve(null); };
+      function limpiar() {
+        _cerrarModal();
+        modalSelectEl.style.display = 'none';
+        modalBloqueaClicFuera = false;
+        modalBtnOk.removeEventListener('click', onOk);
+        modalBtnCancel.removeEventListener('click', onCancel);
+      }
+      modalBtnOk.addEventListener('click', onOk);
+      modalBtnCancel.addEventListener('click', onCancel);
+    });
+  }
+
+  // Cerrar al pulsar fuera del cuadro (equivale a cancelar) — salvo que el
+  // propio modal haya pedido bloquear esto (ver modalBloqueaClicFuera).
+  modalOverlay.addEventListener('click', (e) => {
+    if (e.target === modalOverlay && !modalBloqueaClicFuera) {
+      if (modalBtnCancel.style.display !== 'none') modalBtnCancel.click();
+      else modalBtnOk.click();
+    }
+  });
+
+  document.getElementById('btnSalir').addEventListener('click', async () => {
+    if (typeof confirmarDescartarEdicionHistorial === 'function' && !(await confirmarDescartarEdicionHistorial())) return;
+    if (typeof confirmarDescartarEdicionGravedadMotivos === 'function' && !(await confirmarDescartarEdicionGravedadMotivos())) return;
+    if (!(await modalConfirm('¿Cerrar sesión?', { titulo: 'Cerrar sesión' }))) return;
+    sessionStorage.removeItem(SESSION_KEY);
+    // Solo esta ventana: sin scope 'local', Supabase cierra TODAS las
+    // sesiones de ese usuario (otras ventanas u otros PC con el mismo
+    // usuario se quedaban sin sesión y mostraban todo a 0).
+    await sb.auth.signOut({ scope: 'local' });
+    if (typeof activarVista === 'function') activarVista('inicio');
+    mostrarLogin();
+  });
+
+  // Comprobación de sesión al cargar
+  const sesionActiva = getSesion();
+  if (sesionActiva) {
+    mostrarApp(sesionActiva);
+  } else {
+    mostrarLogin();
+  }
+
+  // ---------------------------------------------------------------
+  // Toasts: avisos flotantes breves (p.ej. "Correo enviado
+  // correctamente"), arriba a la derecha. No bloquean la interfaz
+  // como los modales de arriba, y se quitan solos a los 3 segundos.
+  // ---------------------------------------------------------------
+  //
+  // Con { posicion: 'abajo' } sale abajo del todo, centrado y animado
+  // (sube con rebote, el icono "salta" y una barra se va vaciando hasta
+  // que desaparece). Se usa, p. ej., al crear/editar tiendas.
+  function mostrarToast(mensaje, { icono = '✓', duracionMs = 3000, posicion = 'arriba' } = {}) {
+    const abajo = posicion === 'abajo';
+    const idCont = abajo ? 'toastContainerAbajo' : 'toastContainer';
+    let cont = document.getElementById(idCont);
+    if (!cont) {
+      cont = document.createElement('div');
+      cont.id = idCont;
+      document.body.appendChild(cont);
+    }
+
+    const toast = document.createElement('div');
+    toast.className = abajo ? 'toast toast-abajo' : 'toast';
+    const textoSeguro = typeof escapeHtml === 'function' ? escapeHtml(mensaje) : mensaje;
+    toast.innerHTML = `<span class="toast-glyph">${icono}</span><span>${textoSeguro}</span>`
+      + (abajo ? `<span class="toast-barra" style="animation-duration:${duracionMs}ms"></span>` : '');
+    cont.appendChild(toast);
+
+    requestAnimationFrame(() => toast.classList.add('show'));
+
+    setTimeout(() => {
+      toast.classList.remove('show');
+      if (abajo) toast.classList.add('hide');
+      setTimeout(() => toast.remove(), abajo ? 350 : 200);
+    }, duracionMs);
+  }

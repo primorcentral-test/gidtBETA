@@ -1,0 +1,723 @@
+  // Siniestros del día (roturas confirmadas y faltas)
+  // ---------------------------------------------------------------
+  const MOTIVOS_SINIESTRO = { 'FALTAS': 'FALTA', 'ROTURA CONFIRMADA': 'ROTURA' };
+  let siniestrosHoyCache = []; // [{ id, tipo, estado, fotos, fecha_limite, incidencia:{...,tiendas:{...,agencias:{...}}} }]
+
+  // A partir del array de motivos de una incidencia, decide si genera un siniestro
+  // de tipo FALTA, ROTURA o MIXTO (si están presentes ambos motivos a la vez).
+  function tipoSiniestroDeMotivos(motivos) {
+    const arr = motivos || [];
+    const tieneFalta = arr.includes('FALTAS');
+    const tieneRotura = arr.includes('ROTURA CONFIRMADA');
+    if (tieneFalta && tieneRotura) return 'MIXTO';
+    if (tieneFalta) return 'FALTA';
+    if (tieneRotura) return 'ROTURA';
+    return null;
+  }
+
+  // Revisa TODAS las incidencias de hoy con ROTURA CONFIRMADA/FALTAS y crea,
+  // actualiza o deja igual su siniestro asociado. No toca el DOM — se puede
+  // llamar tanto desde la pestaña Siniestros como en segundo plano al cargar
+  // la app, para arrastrar incidencias marcadas antes de abrir esa pestaña.
+  // Devuelve { incs, existentesPorIncidencia } para quien quiera pintar con ello.
+  async function sincronizarSiniestrosDelDia() {
+    if (!informeHoyCache) return { incs: [], existentesPorIncidencia: new Map() };
+
+    // 1. Incidencias de hoy cuyo motivo incluye FALTAS o ROTURA CONFIRMADA
+    const { data: incs, error: e1 } = await sb
+      .from('incidencias')
+      // tiendas tiene varios enlaces a agencias (habitual, sábado...), así que
+      // hay que decir cuál (!tiendas_agencia_id_fkey). Además se trae la
+      // agencia que ENTREGÓ ese día (snapshot de la incidencia, puede ser la
+      // de sábado, un cambio puntual, prueba o especial): es la que se pinta
+      // y a la que se envía la reclamación.
+      .select(`
+        id, motivo, observaciones, tienda_hora_prevista,
+        tiendas ( id, nombre, hora_prevista,
+          agencias!tiendas_agencia_id_fkey ( id, nombre, emails )
+        ),
+        agencia_dia:agencias!incidencias_agencia_id_fkey ( id, nombre, emails )
+      `)
+      .eq('informe_id', informeHoyCache.id)
+      .overlaps('motivo', Object.keys(MOTIVOS_SINIESTRO));
+    if (e1) throw e1;
+    (incs || []).forEach(i => {
+      if (!i.tiendas) return;
+      if (i.agencia_dia) i.tiendas.agencias = i.agencia_dia;
+      if (i.tienda_hora_prevista) i.tiendas.hora_prevista = i.tienda_hora_prevista;
+    });
+
+    if (!incs.length) return { incs: [], existentesPorIncidencia: new Map() };
+
+    // 2. Siniestros ya existentes para esas incidencias
+    const idsIncidencias = incs.map(i => i.id);
+    const { data: existentes, error: e2 } = await sb
+      .from('siniestros')
+      .select('id, incidencia_id, tipo, tipo_enviado, estado, fotos, fecha_limite, enviado_en, enviado_por')
+      .in('incidencia_id', idsIncidencias);
+    if (e2) throw e2;
+
+    const existentesPorIncidencia = new Map(existentes.map(s => [s.incidencia_id, s]));
+
+    // 3. Crear los que falten (incluye las marcadas antes de tener esta sincronización)
+    const faltantes = incs.filter(i => !existentesPorIncidencia.has(i.id));
+    if (faltantes.length) {
+      const fechaLimite = new Date(informeHoyCache.fecha + 'T00:00:00');
+      fechaLimite.setDate(fechaLimite.getDate() + 15);
+      const fechaLimiteISO = fechaLocalISO(fechaLimite);
+
+      const nuevos = faltantes.map(i => ({
+        incidencia_id: i.id,
+        tipo: tipoSiniestroDeMotivos(i.motivo),
+        estado: 'PENDIENTE',
+        fecha_limite: fechaLimiteISO
+      }));
+
+      // Esta función se lanza desde varios sitios a la vez al cargar. Si dos
+      // llamadas coinciden, ambas ven que falta el siniestro e intentan
+      // crearlo: el índice único de siniestros.incidencia_id lo impide y
+      // ignoreDuplicates hace que la segunda no dé error (simplemente no
+      // inserta). Después se releen los de esas incidencias para quedarse
+      // con el que existe de verdad, lo haya creado esta llamada u otra.
+      const { error: e3 } = await sb.from('siniestros')
+        .upsert(nuevos, { onConflict: 'incidencia_id', ignoreDuplicates: true });
+      if (e3) throw e3;
+      const { data: creados, error: e4 } = await sb.from('siniestros')
+        .select('id, incidencia_id, tipo, tipo_enviado, estado, fotos, fecha_limite, enviado_en, enviado_por')
+        .in('incidencia_id', faltantes.map(i => i.id));
+      if (e4) throw e4;
+      (creados || []).forEach(s => existentesPorIncidencia.set(s.incidencia_id, s));
+    }
+
+    // 3.5. Si los motivos de una incidencia cambiaron después de crear su siniestro
+    // (ej: era solo ROTURA y ahora también tiene FALTAS), recalculamos y sincronizamos
+    // el tipo. Si ya estaba ENVIADO, también se actualiza (y su fila del Panel
+    // siniestros): queda "pendiente de reenviar" hasta que se mande la
+    // actualización a la agencia desde el panel. Los ANULADOS no se tocan.
+    const desincronizados = incs.filter(i => {
+      const s = existentesPorIncidencia.get(i.id);
+      return s && (s.estado === 'PENDIENTE' || s.estado === 'ENVIADO') && s.tipo !== tipoSiniestroDeMotivos(i.motivo);
+    });
+    if (desincronizados.length) {
+      await Promise.all(desincronizados.map(async i => {
+        const s = existentesPorIncidencia.get(i.id);
+        const nuevoTipo = tipoSiniestroDeMotivos(i.motivo);
+        s.tipo = nuevoTipo;
+        await sb.from('siniestros').update({ tipo: nuevoTipo }).eq('id', s.id);
+        if (typeof psActualizarTipoDesdeSiniestro === 'function') {
+          try { await psActualizarTipoDesdeSiniestro(s.id, nuevoTipo, s.fecha_limite); }
+          catch (err) { console.error('No se pudo actualizar el tipo en el Panel siniestros:', err); }
+        }
+      }));
+    }
+
+    return { incs, existentesPorIncidencia };
+  }
+
+  // Con la ventana de carga global (js/carga-global.js).
+  async function renderVistaSiniestros() {
+    return conCargaGlobal(() => renderVistaSiniestrosSinCarga());
+  }
+
+  async function renderVistaSiniestrosSinCarga() {
+    const cont = document.getElementById('contenidoSiniestros');
+    if (!informeHoyCache) {
+      cont.innerHTML = `
+        <div class="card">
+          <div class="empty">
+            <div class="glyph">📋</div>
+            <h3>Aún no hay informe para hoy</h3>
+            <p>Genera el informe diario desde Inicio para poder detectar siniestros.</p>
+          </div>
+        </div>`;
+      return;
+    }
+
+    cont.innerHTML = `<div class="card"><div class="empty"><p>Buscando roturas y faltas de hoy…</p></div></div>`;
+
+    try {
+      const { incs, existentesPorIncidencia } = await sincronizarSiniestrosDelDia();
+
+      if (!incs.length) {
+        siniestrosHoyCache = [];
+        actualizarKpiSiniestros();
+        cont.innerHTML = `
+          <div class="card">
+            <div class="empty">
+              <div class="glyph">✅</div>
+              <h3>Sin roturas ni faltas hoy</h3>
+              <p>No se ha detectado ninguna tienda con "FALTAS" o "ROTURA CONFIRMADA" en el informe de hoy.</p>
+            </div>
+          </div>`;
+        return;
+      }
+
+      // Combinar todo para pintar
+      siniestrosHoyCache = incs.map(i => ({
+        ...existentesPorIncidencia.get(i.id),
+        incidencia: i
+      }));
+
+      renderKanbanSiniestros();
+      actualizarKpiSiniestros();
+    } catch (err) {
+      console.error('Error cargando siniestros de hoy:', err);
+      cont.innerHTML = `<div class="card"><div class="empty"><p style="color:var(--grave);">Error al cargar los siniestros.</p></div></div>`;
+    }
+  }
+
+  function renderKanbanSiniestros() {
+    const cont = document.getElementById('contenidoSiniestros');
+    const roturas = siniestrosHoyCache.filter(s => s.tipo === 'ROTURA');
+    const faltas = siniestrosHoyCache.filter(s => s.tipo === 'FALTA');
+    const mixtos = siniestrosHoyCache.filter(s => s.tipo === 'MIXTO');
+
+    const badgeEstado = (estado, s) => {
+      if (s && siniestroPendienteReenvio(s)) return '<span class="badge-envio reenviar">Reenviar</span>';
+      if (estado === 'ENVIADO') return '<span class="badge-envio enviado">Enviado</span>';
+      if (estado === 'ANULADO') return '<span class="badge-envio anulado">Anulado</span>';
+      return '<span class="badge-envio pendiente">Pendiente</span>';
+    };
+
+    const tarjeta = (s) => {
+      const t = s.incidencia.tiendas || {};
+      const ag = t.agencias || {};
+      const numFotos = (s.fotos || []).length;
+      return `
+        <div class="siniestro-card ${s.estado === 'ANULADO' ? 'anulado' : ''}${siniestroPendienteReenvio(s) ? ' cambiado' : ''}" data-siniestro="${s.id}">
+          <div class="fila-top">
+            <b>${escapeHtml(t.nombre || '—')}</b>
+            ${badgeEstado(s.estado, s)}
+          </div>
+          <div class="agencia">${escapeHtml(ag.nombre || 'Sin agencia')} · ${t.hora_prevista ? t.hora_prevista.slice(0,5) : '—'}</div>
+          ${s.incidencia.observaciones ? `<div class="obs">${escapeHtml(s.incidencia.observaciones)}</div>` : ''}
+          <div class="fotos-mini">📷 ${numFotos} foto${numFotos===1?'':'s'}</div>
+          ${siniestroPendienteReenvio(s) ? `<div class="aviso">⚠️ ${escapeHtml(textoEnviadoComo(s))} · falta reenviar la actualización</div>` : ''}
+        </div>`;
+    };
+
+    const dot = `<svg width="9" height="9" viewBox="0 0 9 9" style="flex:0 0 auto;"><circle cx="4.5" cy="4.5" r="4.5" fill="currentColor"/></svg>`;
+
+    cont.innerHTML = `
+      <div class="siniestros-kanban">
+        <div class="kanban-col roturas">
+          <div class="kanban-col-head">${dot} Roturas confirmadas <span class="count">${roturas.length}</span></div>
+          ${roturas.length ? roturas.map(tarjeta).join('') : '<div class="card"><div class="empty" style="padding:24px;"><p>Sin roturas hoy.</p></div></div>'}
+        </div>
+        <div class="kanban-col faltas">
+          <div class="kanban-col-head">${dot} Faltas <span class="count">${faltas.length}</span></div>
+          ${faltas.length ? faltas.map(tarjeta).join('') : '<div class="card"><div class="empty" style="padding:24px;"><p>Sin faltas hoy.</p></div></div>'}
+        </div>
+        <div class="kanban-col mixtos">
+          <div class="kanban-col-head">${dot} Roturas y Faltas <span class="count">${mixtos.length}</span></div>
+          ${mixtos.length ? mixtos.map(tarjeta).join('') : '<div class="card"><div class="empty" style="padding:24px;"><p>Sin casos mixtos hoy.</p></div></div>'}
+        </div>
+      </div>`;
+
+    cont.querySelectorAll('[data-siniestro]').forEach(card => {
+      card.addEventListener('click', () => abrirModalSiniestro(Number(card.dataset.siniestro)));
+    });
+  }
+
+  function actualizarKpiSiniestros() {
+    const pendientes = siniestrosHoyCache.filter(s => s.estado === 'PENDIENTE').length;
+    document.getElementById('kpiSiniestrosPend').textContent = pendientes;
+    document.getElementById('dotSiniestros').classList.toggle('show', pendientes > 0);
+    // Tarjeta de Inicio "Siniestros sin enviar" (suma del día + Panel)
+    if (typeof inicioActualizarKpiSiniestros === 'function') inicioActualizarKpiSiniestros();
+  }
+
+  // Refresca el KPI "Siniestros pendientes de envío" de Inicio y el punto rojo
+  // de la pestaña, consultando directamente la base de datos — funciona aunque
+  // el usuario nunca haya entrado en la pestaña Siniestros en esta sesión.
+  async function actualizarKpiSiniestrosDesdeDB() {
+    const kpiEl = document.getElementById('kpiSiniestrosPend');
+    const dotEl = document.getElementById('dotSiniestros');
+    if (!informeHoyCache) {
+      if (kpiEl) kpiEl.textContent = '0';
+      if (dotEl) dotEl.classList.remove('show');
+      if (typeof inicioActualizarKpiSiniestros === 'function') inicioActualizarKpiSiniestros();
+      return;
+    }
+    try {
+      // Primero sincroniza (crea/actualiza siniestros que falten, incluidas
+      // incidencias marcadas antes de entrar nunca en la pestaña Siniestros),
+      // y cuenta directamente sobre el resultado — sin una segunda consulta.
+      const { existentesPorIncidencia } = await sincronizarSiniestrosDelDia();
+      const pendientes = Array.from(existentesPorIncidencia.values()).filter(s => s.estado === 'PENDIENTE').length;
+      if (kpiEl) kpiEl.textContent = pendientes;
+      if (dotEl) dotEl.classList.toggle('show', pendientes > 0);
+      if (typeof inicioActualizarKpiSiniestros === 'function') inicioActualizarKpiSiniestros();
+    } catch (err) {
+      console.error('Error actualizando KPI de siniestros:', err);
+    }
+  }
+
+  // Crea, actualiza o elimina la fila de `siniestros` de una incidencia justo
+  // al guardarla (sin esperar a que el usuario entre en la pestaña Siniestros),
+  // y refresca el KPI de Inicio y el kanban si ya está abierto.
+  async function sincronizarSiniestroIncidencia(incidenciaId, motivos) {
+    if (!informeHoyCache) return;
+    const tipo = tipoSiniestroDeMotivos(motivos);
+    let filaPanelCambiada = null;
+
+    try {
+      const { data: existente, error: eSel } = await sb
+        .from('siniestros')
+        .select('id, tipo, estado, fecha_limite')
+        .eq('incidencia_id', incidenciaId)
+        .maybeSingle();
+      if (eSel) throw eSel;
+
+      if (!tipo) {
+        // Ya no hay ROTURA CONFIRMADA ni FALTAS en esta incidencia:
+        // si tenía un siniestro PENDIENTE asociado, lo quitamos.
+        if (existente && existente.estado === 'PENDIENTE') {
+          if (typeof psBorrarFilaPanelSinEnviar === 'function') await psBorrarFilaPanelSinEnviar({ siniestroId: existente.id });
+          const { error: eDel } = await sb.from('siniestros').delete().eq('id', existente.id);
+          if (eDel) throw eDel;
+        }
+      } else if (!existente) {
+        const fechaLimite = new Date(informeHoyCache.fecha + 'T00:00:00');
+        fechaLimite.setDate(fechaLimite.getDate() + 15);
+        // upsert + ignoreDuplicates: si otra llamada lo acaba de crear a la
+        // vez, el índice único de incidencia_id evita el duplicado sin error.
+        const { error: eIns } = await sb.from('siniestros').upsert({
+          incidencia_id: incidenciaId,
+          tipo,
+          estado: 'PENDIENTE',
+          fecha_limite: fechaLocalISO(fechaLimite)
+        }, { onConflict: 'incidencia_id', ignoreDuplicates: true });
+        if (eIns) throw eIns;
+      } else if (existente.estado === 'PENDIENTE' && existente.tipo !== tipo) {
+        const { error: eUpd } = await sb.from('siniestros').update({ tipo }).eq('id', existente.id);
+        if (eUpd) throw eUpd;
+        // Por si ya tiene fila en el panel (envío que falló): mismo tipo allí.
+        if (typeof psActualizarTipoDesdeSiniestro === 'function') {
+          await psActualizarTipoDesdeSiniestro(existente.id, tipo, existente.fecha_limite);
+        }
+      } else if (existente.estado === 'ENVIADO' && existente.tipo !== tipo) {
+        // Ya se había mandado a la agencia: se cambia el tipo aquí y en el
+        // Panel siniestros, y se avisa de que falta reenviar la
+        // actualización (con opción de ir directamente a ese siniestro).
+        const { error: eUpd } = await sb.from('siniestros').update({ tipo }).eq('id', existente.id);
+        if (eUpd) throw eUpd;
+        if (typeof psActualizarTipoDesdeSiniestro === 'function') {
+          filaPanelCambiada = await psActualizarTipoDesdeSiniestro(existente.id, tipo, existente.fecha_limite);
+        }
+      }
+    } catch (err) {
+      console.error('Error sincronizando siniestro de la incidencia:', err);
+    }
+
+    await actualizarKpiSiniestrosDesdeDB();
+
+    // Si la pestaña Siniestros ya está abierta, refrescamos su kanban también
+    // para que se vea el cambio al instante sin tener que volver a entrar.
+    if (document.getElementById('view-siniestros')?.classList.contains('active')) {
+      renderVistaSiniestros();
+    }
+
+    if (filaPanelCambiada) {
+      if (typeof cargarPendienteAtencion === 'function') cargarPendienteAtencion();
+      if (typeof psAvisarSiniestroActualizado === 'function') await psAvisarSiniestroActualizado(filaPanelCambiada);
+    }
+  }
+
+  // ---- Modal de detalle de siniestro ----
+  let siniestroActivoId = null;
+  // Siniestro de un día ANTERIOR abierto en este mismo modal (desde la tarea
+  // grave de Inicio o desde el Historial de siniestros): se marcó FALTAS o
+  // ROTURA CONFIRMADA pero no se llegó a enviar ese día. Lleva además
+  // .fechaInforme (fecha de recepción), que sustituye a informeHoyCache.fecha
+  // en la plantilla del correo y al registrarlo en el Panel siniestros.
+  let siniestroExterno = null;
+
+  // Enviado a la agencia con un tipo y luego cambiado en el informe: falta
+  // mandar la actualización desde el Panel siniestros.
+  function siniestroPendienteReenvio(s) {
+    return !!s && s.estado === 'ENVIADO' && !!s.tipo_enviado && s.tipo !== s.tipo_enviado;
+  }
+  const TIPO_SINIESTRO_TXT = { ROTURA: 'ROTURA', FALTA: 'FALTAS', MIXTO: 'ROTURAS Y FALTAS' };
+  // "Enviado como ROTURA · ahora es ROTURAS Y FALTAS"
+  function textoEnviadoComo(s) {
+    return `Enviado como ${TIPO_SINIESTRO_TXT[s.tipo_enviado] || s.tipo_enviado} · ahora es ${TIPO_SINIESTRO_TXT[s.tipo] || s.tipo}`;
+  }
+
+  function siniestroPorId(id) {
+    if (siniestroExterno && siniestroExterno.id === id) return siniestroExterno;
+    return siniestrosHoyCache.find(s => s.id === id);
+  }
+
+  function esSiniestroExterno(s) {
+    return !!s && s === siniestroExterno;
+  }
+
+  // Carga un siniestro de cualquier día (con la misma forma que las filas de
+  // siniestrosHoyCache) y abre su modal para añadir fotos y enviarlo.
+  async function abrirModalSiniestroExterno(id) {
+    if (typeof mostrarCargandoGlobal === 'function') mostrarCargandoGlobal();
+    try {
+      const { data: s, error } = await sb
+        .from('siniestros')
+        .select(`
+          id, incidencia_id, tipo, tipo_enviado, estado, fotos, fecha_limite, enviado_en, enviado_por,
+          incidencia:incidencias (
+            id, motivo, observaciones, tienda_nombre, tienda_hora_prevista,
+            informes_diarios ( fecha ),
+            tiendas ( id, nombre, hora_prevista,
+              agencias!tiendas_agencia_id_fkey ( id, nombre, emails )
+            ),
+            agencia_dia:agencias!incidencias_agencia_id_fkey ( id, nombre, emails )
+          )
+        `)
+        .eq('id', id)
+        .maybeSingle();
+      if (error) throw error;
+      if (!s || !s.incidencia) {
+        await modalAlert('No se ha encontrado ese siniestro. Puede que se haya borrado.', { titulo: 'Siniestro' });
+        if (typeof cargarPendienteAtencion === 'function') cargarPendienteAtencion();
+        return;
+      }
+      const i = s.incidencia;
+      // Igual que en sincronizarSiniestrosDelDia: la agencia que ENTREGÓ ese
+      // día (snapshot de la incidencia) es la que se pinta y a la que se envía.
+      if (!i.tiendas) i.tiendas = { id: null, nombre: i.tienda_nombre, hora_prevista: null };
+      if (i.agencia_dia) i.tiendas.agencias = i.agencia_dia;
+      if (i.tienda_hora_prevista) i.tiendas.hora_prevista = i.tienda_hora_prevista;
+      s.fechaInforme = i.informes_diarios?.fecha || null;
+
+      siniestroExterno = s;
+      abrirModalSiniestro(s.id);
+    } catch (err) {
+      console.error('Error abriendo el siniestro:', err);
+      await modalAlert(`No se pudo abrir el siniestro: ${err.message}`, { titulo: 'Error' });
+    } finally {
+      if (typeof ocultarCargandoGlobal === 'function') ocultarCargandoGlobal();
+    }
+  }
+
+  // Tras subir/borrar fotos o enviar: el del día repinta su kanban; el de un
+  // día anterior no está en el kanban (no se toca: hoy puede ni haber informe).
+  function refrescarVistaTrasCambioSiniestro(s) {
+    if (esSiniestroExterno(s)) return;
+    renderKanbanSiniestros();
+  }
+
+  function abrirModalSiniestro(id) {
+    siniestroActivoId = id;
+    pintarModalSiniestro();
+    document.getElementById('siniestroModalOverlay').classList.add('show');
+  }
+
+  function cerrarModalSiniestro() {
+    document.getElementById('siniestroModalOverlay').classList.remove('show');
+    siniestroActivoId = null;
+    // Al cerrar uno de un día anterior se refrescan las tareas de Inicio y,
+    // si está abierto en ese mismo día, el Historial de siniestros.
+    if (siniestroExterno) {
+      const fecha = siniestroExterno.fechaInforme;
+      siniestroExterno = null;
+      if (typeof cargarPendienteAtencion === 'function') cargarPendienteAtencion();
+      const inp = document.getElementById('historialSiniestrosFechaInput');
+      if (fecha && inp && inp.value === fecha
+          && document.getElementById('view-historial-siniestros')?.classList.contains('active')
+          && typeof cargarHistorialSiniestros === 'function') {
+        cargarHistorialSiniestros(fecha);
+      }
+    }
+  }
+
+  function escapeHtmlSiniestro(str) {
+    return String(str ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  function pintarModalSiniestro() {
+    const s = siniestroPorId(siniestroActivoId);
+    if (!s) return;
+    const t = s.incidencia.tiendas || {};
+    const ag = t.agencias || {};
+
+    document.getElementById('siniestroModalTipo').textContent = s.tipo === 'ROTURA' ? 'Rotura confirmada' : (s.tipo === 'MIXTO' ? 'Rotura y Falta' : 'Falta');
+    document.getElementById('siniestroModalTipo').className = 'pill ' + (s.tipo === 'ROTURA' ? 'moderado' : 'grave');
+    document.getElementById('siniestroModalTitulo').textContent = t.nombre || '—';
+
+    const filas = [];
+    if (esSiniestroExterno(s) && s.fechaInforme) {
+      const fI = new Date(s.fechaInforme + 'T00:00:00');
+      const txtDia = `${dias[fI.getDay()].toLowerCase()} ${formatearFechaCorta(fI)}`;
+      filas.push(s.estado === 'PENDIENTE'
+        ? `<div class="meta-row olvidado"><span class="ic">🚨</span>Siniestro del ${txtDia} sin enviar ni registrar en el Panel siniestros</div>`
+        : `<div class="meta-row"><span class="ic">📅</span>Siniestro del ${txtDia}</div>`);
+    }
+    const pendienteReenvio = siniestroPendienteReenvio(s);
+    if (pendienteReenvio) {
+      filas.push(`<div class="meta-row cambiado"><span class="ic">⚠️</span>${escapeHtmlSiniestro(textoEnviadoComo(s))}</div>`);
+    }
+    filas.push(`<div class="meta-row"><span class="ic">🚚</span>${escapeHtmlSiniestro(ag.nombre || 'Sin agencia')} · Hora prevista ${t.hora_prevista ? t.hora_prevista.slice(0,5) : '—'}</div>`);
+    if (s.incidencia.observaciones) {
+      filas.push(`<div class="meta-row"><span class="ic">📝</span>${escapeHtmlSiniestro(s.incidencia.observaciones)}</div>`);
+    }
+    if (s.fecha_limite) {
+      filas.push(`<div class="meta-row limite"><span class="ic">⏳</span>Fecha límite de reclamación: ${formatearFechaCorta(new Date(s.fecha_limite+'T00:00:00'))}</div>`);
+    }
+    document.getElementById('siniestroModalMeta').innerHTML = filas.join('');
+
+    const grid = document.getElementById('siniestroFotosGrid');
+    const puedeQuitarFotos = s.estado === 'PENDIENTE';
+    grid.innerHTML = (s.fotos || []).map((url, idx) => `
+      <div class="foto-item">
+        <img data-src-archivo="${url}" loading="lazy" data-abrir-foto="${url}" style="cursor:zoom-in;">
+        ${puedeQuitarFotos ? `<button data-quitar-foto="${idx}" title="Borrar foto">🗑️</button>` : ''}
+      </div>`).join('');
+    firmarImagenesEn(grid);
+    grid.querySelectorAll('[data-abrir-foto]').forEach(img => {
+      img.addEventListener('click', () => abrirLightboxPanel(img.dataset.abrirFoto));
+    });
+    grid.querySelectorAll('[data-quitar-foto]').forEach(btn => {
+      btn.addEventListener('click', () => quitarFotoSiniestro(Number(btn.dataset.quitarFoto)));
+    });
+    const numFotos = (s.fotos || []).length;
+    document.getElementById('siniestroFotosNum').textContent = numFotos;
+    const dz = document.getElementById('siniestroFotosDropzone');
+    if (dz) {
+      dz.classList.toggle('compacta', numFotos > 0);
+      document.getElementById('siniestroDropzoneSub').innerHTML = numFotos > 0
+        ? '➕ Añadir más fotos · arrastra o haz clic'
+        : 'o <b>haz clic para seleccionar</b>';
+    }
+
+    const estadoEl = document.getElementById('siniestroModalEstado');
+    estadoEl.className = 'siniestro-estado' + (pendienteReenvio ? ' cambiado' : s.estado === 'ENVIADO' ? ' enviado' : s.estado === 'ANULADO' ? ' anulado' : '');
+    document.getElementById('siniestroModalEstadoTxt').textContent =
+      pendienteReenvio ? 'Pendiente de reenviar desde el Panel siniestros'
+      : s.estado === 'ENVIADO'
+        ? (() => {
+            if (!s.enviado_en) return 'Enviado';
+            const f = new Date(s.enviado_en);
+            const fechaTxt = formatearFechaCorta(f);
+            const horaTxt = f.toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' });
+            return `Enviado el ${fechaTxt} a las ${horaTxt}h por: ${s.enviado_por || '—'}`;
+          })()
+      : s.estado === 'ANULADO' ? '🚫 Anulado desde el Panel siniestros'
+      : 'Pendiente de envío';
+    document.getElementById('btnEnviarSiniestro').style.display = s.estado === 'PENDIENTE' ? '' : 'none';
+    const btnIrPanel = document.getElementById('btnSiniestroIrPanel');
+    if (btnIrPanel) btnIrPanel.style.display = pendienteReenvio ? '' : 'none';
+    const sinFotos = !(s.fotos || []).length;
+    document.getElementById('btnEnviarSiniestro').disabled = s.estado === 'PENDIENTE' && sinFotos;
+    document.getElementById('btnEnviarSiniestro').title = sinFotos ? 'Añade al menos 1 foto para poder enviar' : '';
+    const dropzone = document.getElementById('siniestroFotosDropzone');
+    if (dropzone) dropzone.style.display = s.estado === 'PENDIENTE' ? '' : 'none';
+  }
+
+  document.getElementById('btnCerrarSiniestroModal').addEventListener('click', cerrarModalSiniestro);
+  // Pinchar fuera del modal ya NO lo cierra (se cerraba sin querer al
+  // arrastrar fotos o al hacer clic al lado): solo se cierra con la ✕.
+
+  async function subirFotosASiniestro(files) {
+    if (!files.length) return;
+    const s = siniestroPorId(siniestroActivoId);
+    if (!s || s.estado !== 'PENDIENTE') return;
+    const errEl = document.getElementById('siniestroFotosError');
+    errEl.style.display = 'none';
+
+    // Placeholders "subiendo…" en la rejilla mientras se comprimen y suben las fotos,
+    // para que el usuario vea al instante que algo está pasando (spinner + barra).
+    const grid = document.getElementById('siniestroFotosGrid');
+    const placeholders = files.map(() => {
+      const div = document.createElement('div');
+      div.className = 'foto-item subiendo';
+      div.innerHTML = '<div class="foto-spin"></div><div class="foto-bar-wrap"><div class="foto-bar"></div></div>';
+      grid.appendChild(div);
+      return div;
+    });
+
+    try {
+      const urls = [];
+      for (const file of files) {
+        const comprimido = await comprimirImagenParaSubida(file);
+        const path = `siniestro-${s.id}/${Date.now()}-${nombreSeguroParaStorage(comprimido.name)}`;
+        const { error: eUp } = await sb.storage.from('siniestros-fotos').upload(path, comprimido);
+        if (eUp) throw eUp;
+        const { data: pub } = sb.storage.from('siniestros-fotos').getPublicUrl(path);
+        urls.push(pub.publicUrl);
+      }
+      const fotosActualizadas = [...(s.fotos || []), ...urls];
+      const { error: eDb } = await sb.from('siniestros').update({ fotos: fotosActualizadas }).eq('id', s.id);
+      if (eDb) throw eDb;
+
+      s.fotos = fotosActualizadas;
+      pintarModalSiniestro();
+      refrescarVistaTrasCambioSiniestro(s);
+    } catch (err) {
+      console.error('Error subiendo fotos:', err);
+      errEl.textContent = 'No se pudieron subir las fotos.';
+      errEl.style.display = 'block';
+      placeholders.forEach(p => p.remove());
+    }
+  }
+
+  document.getElementById('siniestroFotosInput').addEventListener('change', async (e) => {
+    const files = Array.from(e.target.files || []);
+    await subirFotosASiniestro(files);
+    e.target.value = '';
+  });
+
+  // ---- Arrastrar y soltar fotos sobre la zona de "Añadir fotos" ----
+  (() => {
+    const dropzone = document.getElementById('siniestroFotosDropzone');
+    if (!dropzone) return;
+    let dragCounter = 0;
+
+    dropzone.addEventListener('dragenter', (e) => {
+      e.preventDefault();
+      dragCounter++;
+      dropzone.classList.add('dragover');
+    });
+    dropzone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+    });
+    dropzone.addEventListener('dragleave', () => {
+      dragCounter = Math.max(0, dragCounter - 1);
+      if (dragCounter === 0) dropzone.classList.remove('dragover');
+    });
+    dropzone.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      dragCounter = 0;
+      dropzone.classList.remove('dragover');
+      const files = Array.from(e.dataTransfer?.files || []).filter(f => f.type.startsWith('image/'));
+      if (!files.length) return;
+      await subirFotosASiniestro(files);
+    });
+  })();
+
+  async function quitarFotoSiniestro(idx) {
+    const s = siniestroPorId(siniestroActivoId);
+
+    const ok = await modalConfirm('¿Seguro que quieres borrar esta foto del siniestro?', { titulo: 'Borrar foto', danger: true, textoOk: 'Borrar' });
+    if (!ok) return;
+
+    const urlAEliminar = (s.fotos || [])[idx];
+    const fotosActualizadas = (s.fotos || []).filter((_, i) => i !== idx);
+    try {
+      const { error } = await sb.from('siniestros').update({ fotos: fotosActualizadas }).eq('id', s.id);
+      if (error) throw error;
+      s.fotos = fotosActualizadas;
+      pintarModalSiniestro();
+      refrescarVistaTrasCambioSiniestro(s);
+      if (typeof registrarAccion === 'function') {
+        registrarAccion('siniestros', 'Borrar foto de siniestro', s?.incidencia?.tiendas?.nombre || '—');
+      }
+      if (urlAEliminar) {
+        try {
+          const marcador = '/object/public/siniestros-fotos/';
+          const idxUrl = urlAEliminar.indexOf(marcador);
+          if (idxUrl !== -1) {
+            const path = decodeURIComponent(urlAEliminar.slice(idxUrl + marcador.length));
+            const { error: eStorage } = await sb.storage.from('siniestros-fotos').remove([path]);
+            if (eStorage) console.error('No se pudo borrar la foto del storage:', eStorage);
+          }
+        } catch (errStorage) {
+          console.error('Error borrando foto del storage:', errStorage);
+        }
+      }
+    } catch (err) {
+      console.error('Error quitando foto:', err);
+    }
+  }
+
+  // Siniestro modificado tras enviarlo: el reenvío se hace desde el Panel
+  // siniestros, así que este botón lleva directamente a su detalle.
+  document.getElementById('btnSiniestroIrPanel')?.addEventListener('click', async () => {
+    const s = siniestroPorId(siniestroActivoId);
+    if (!s) return;
+    try {
+      const { data: fila, error } = await sb.from('panel_siniestros').select('id').eq('siniestro_id', s.id).maybeSingle();
+      if (error) throw error;
+      if (!fila) {
+        await modalAlert('Este siniestro no está en el Panel siniestros.', { titulo: 'No encontrado' });
+        return;
+      }
+      cerrarModalSiniestro();
+      if (typeof psIrADetalleSiniestro === 'function') await psIrADetalleSiniestro(fila.id);
+    } catch (err) {
+      console.error('Error abriendo el siniestro en el Panel siniestros:', err);
+    }
+  });
+
+  document.getElementById('btnEnviarSiniestro').addEventListener('click', async () => {
+    const s = siniestroPorId(siniestroActivoId);
+    const t = s.incidencia.tiendas || {};
+    const ag = t.agencias || {};
+    const emails = ag.emails || [];
+
+    if (!emails.length) {
+      await modalAlert('Esta agencia no tiene emails configurados. Añádelos en Gestión → Agencias.', { titulo: 'Sin destinatarios' });
+      return;
+    }
+    if (!(s.fotos || []).length) {
+      await modalAlert('Añade al menos 1 foto antes de enviar el correo a la agencia.', { titulo: 'Faltan fotos' });
+      return;
+    }
+
+    const ok = await modalConfirm('¿Enviar el correo de reclamación a la agencia ahora?', { titulo: 'Enviar reclamación' });
+    if (!ok) return;
+
+    const btn = document.getElementById('btnEnviarSiniestro');
+    btn.disabled = true;
+    document.getElementById('cargandoEnvioTexto').textContent = 'ENVIANDO CORREO A AGENCIA';
+    document.getElementById('cargandoEnvioOverlay').classList.add('show');
+
+    try {
+      // Fecha de recepción: la del informe del siniestro (puede ser de un día
+      // anterior si se envía desde Inicio o el Historial de siniestros).
+      const fechaInformeISO = s.fechaInforme || informeHoyCache?.fecha;
+      // Se da de alta en el Panel siniestros antes de enviar: si el correo
+      // falla, queda allí como pendiente de enviar.
+      if (typeof psAsegurarFilaPanelAntesDeEnviar === 'function') {
+        await psAsegurarFilaPanelAntesDeEnviar(s, fechaInformeISO);
+      }
+      const { subject, html, text } = plantillaSiniestro(s, fechaInformeISO);
+
+      await enviarEmail({
+        to: emails,
+        subject,
+        html,
+        text,
+        attachmentUrls: s.fotos || []
+      });
+
+      const { error } = await sb.from('siniestros').update({
+        estado: 'ENVIADO',
+        enviado_en: new Date().toISOString(),
+        enviado_por: sesionActual?.nombre || sesionActual?.usuario || null,
+        tipo_enviado: s.tipo
+      }).eq('id', s.id);
+      if (error) throw error;
+
+      s.estado = 'ENVIADO';
+      s.tipo_enviado = s.tipo;
+      s.enviado_en = new Date().toISOString();
+      s.enviado_por = sesionActual?.nombre || sesionActual?.usuario || null;
+      registrarSiniestroEnPanelAutomatico(s, fechaInformeISO);
+      pintarModalSiniestro();
+      if (esSiniestroExterno(s)) {
+        if (typeof cargarPendienteAtencion === 'function') cargarPendienteAtencion();
+      } else {
+        renderKanbanSiniestros();
+        actualizarKpiSiniestros();
+      }
+    } catch (err) {
+      console.error('Error enviando siniestro:', err);
+      document.getElementById('cargandoEnvioOverlay').classList.remove('show');
+      await modalAlert(`No se pudo enviar el correo: ${err.message}`, { titulo: 'Error de envío' });
+    } finally {
+      document.getElementById('cargandoEnvioOverlay').classList.remove('show');
+      btn.disabled = false;
+    }
+  });
+
+  sesionActual = sesionActiva;
+  if (sesionActiva) cargarInformeHoy();
